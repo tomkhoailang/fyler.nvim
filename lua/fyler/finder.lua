@@ -756,6 +756,20 @@ function Finder:mutate()
               vim.schedule_wrap(hooks.on_rename)(action.src, action.dst)
             end
           end
+
+          -- Close + jump if <C-s> triggered this write
+          if _G.fyler_cs_save then
+            local jp = cursor_target
+            _G.fyler_cs_save = nil
+            vim.schedule(function()
+              self:close()
+              if jp and not jp:match('/$') then
+                vim.schedule(function()
+                  vim.cmd('edit ' .. vim.fn.fnameescape(jp))
+                end)
+              end
+            end)
+          end
         end)
       end)
     end
@@ -772,10 +786,15 @@ function Finder:mutate()
   else
     local lines, highlights = H.build_action_confirmation_ui(order, fs_actions, self.state.pseudo_root_path)
     vim.schedule_wrap(input.get_confirmation)(lines, highlights, function(confirmed)
-      if confirmed then do_execute() end
+      if confirmed then
+        -- 'close' means <C-s> was pressed in the confirmation window
+        if confirmed == 'close' then _G.fyler_cs_save = true end
+        do_execute()
+      end
     end)
   end
 end
+
 
 function Finder:open()
   if util.window_is_valid(self.win_id) then

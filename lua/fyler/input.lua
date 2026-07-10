@@ -8,7 +8,7 @@ local util = require('fyler.util')
 ---@param mode string|string[]
 ---@param lhs string
 ---@param rhs string|function
-local buffer_set_keymap = function(buf_id, mode, lhs, rhs) vim.keymap.set(mode, lhs, rhs, { buffer = buf_id }) end
+local buffer_set_keymap = function(buf_id, mode, lhs, rhs) vim.keymap.set(mode, lhs, rhs, { buffer = buf_id, silent = true, nowait = true }) end
 
 ---@param lines string[]|nil
 ---@param highlights table|nil
@@ -71,6 +71,8 @@ M.get_confirmation = function(lines, highlights, callback)
   buffer_set_keymap(buf_id, 'n', 'N', get_callback(false))
   buffer_set_keymap(buf_id, 'n', '<ESC>', get_callback(false))
   buffer_set_keymap(buf_id, 'n', '<C-c>', get_callback(false))
+  -- <C-s> = save and close Fyler (same keycode as <C-S> in most terminals)
+  buffer_set_keymap(buf_id, 'n', '<C-s>', get_callback('close'))
 end
 
 return M
