@@ -71,6 +71,31 @@ local H = {}
 ---@type table<integer, fyler.Finder>
 local instances = {}
 
+M.clipboard = {
+  action = nil,
+  items = {},
+  deleted = {},
+}
+
+local function is_dir_empty(instance, path)
+  if instance and instance._parent_has_children_in_buffer and instance._parent_has_children_in_buffer[path] then
+    return false
+  end
+
+  local uv = vim.uv or vim.loop
+  local handle = uv.fs_scandir(path)
+  if not handle then return true end
+  while true do
+    local name, _ = uv.fs_scandir_next(handle)
+    if not name then break end
+    local child_path = path .. '/' .. name
+    if not M.clipboard.deleted[child_path] then
+      return false
+    end
+  end
+  return true
+end
+
 ---@class fyler.Finder
 local Finder = {}
 
@@ -94,9 +119,10 @@ H.build_action_confirmation_ui = function(order, fs_actions, pseudo_root_path)
   local action_args_components = {}
   for _, i in ipairs(order) do
     local fs_action = fs_actions[i]
-    local action_hl
-    if fs_action.name == 'create' or fs_action.name == 'delete' or fs_action.name == 'trash' then
+    if fs_action.name == 'create' then
       action_hl = 'DiagnosticInfo'
+    elseif fs_action.name == 'delete' or fs_action.name == 'trash' then
+      action_hl = 'DiagnosticError'
     elseif fs_action.name == 'move' then
       action_hl = 'DiagnosticWarn'
     elseif fs_action.name == 'copy' then
@@ -235,22 +261,48 @@ end
 
 ---@private
 ---@return table, integer
-H.build_fs_entry_ui = function(item)
+H.build_fs_entry_ui = function(instance, item)
   local entry_state = item.type == 'directory' and { expanded = item.expanded } or nil
   local icon_char, icon_hl = icon.get(item.type, item.path, entry_state)
-  local indent = item.depth > 0 and string.rep('  ', item.depth) or ''
-  local id_part = string.format('/%0' .. math.ceil(math.log10(state.store_next_id)) .. 'd ', item.id)
   local children = {}
   local name_col = 0
-  if #indent > 0 then
-    table.insert(children, { tag = 'text', value = indent })
-    name_col = name_col + #indent
+  if item.depth > 0 then
+    for i = 1, item.depth do
+      table.insert(children, { tag = 'text', value = '│ ', hl = 'SnacksIndent' })
+    end
+    name_col = name_col + item.depth * 2
   end
+
+  if not icon_char or icon_char == "" then
+    if item.type == 'directory' then
+      local is_empty = is_dir_empty(instance, item.path)
+      if is_empty then
+        icon_char = item.expanded and '' or ''
+      else
+        icon_char = item.expanded and '' or ''
+      end
+      icon_hl = 'FylerDirectoryName'
+    else
+      icon_char = ''
+      icon_hl = 'FylerNormal'
+    end
+  elseif item.type == 'directory' then
+    local is_empty = is_dir_empty(instance, item.path)
+    if is_empty then
+      icon_char = item.expanded and '' or ''
+    else
+      icon_char = item.expanded and '' or ''
+    end
+    icon_hl = 'FylerDirectoryName'
+  end
+
   if icon_char and #icon_char > 0 then
     table.insert(children, { tag = 'text', value = icon_char, hl = icon_hl })
     table.insert(children, { tag = 'text', value = ' ' })
     name_col = name_col + #icon_char + 1
   end
+
+  local id_part = string.format('/%0' .. math.ceil(math.log10(state.store_next_id)) .. 'd ', item.id)
   table.insert(children, { tag = 'text', value = id_part })
   name_col = name_col + #id_part
   table.insert(children, {
@@ -266,13 +318,39 @@ end
 ---@param buf_lines string[]
 ---@return fyler.Action[], string[]
 H.compute_fs_actions = function(instance, id_to_path, buf_lines)
+  local preprocessed_lines = {}
+  for _, line in ipairs(buf_lines) do
+    local content = line:gsub("│ ", ""):gsub("%s+", "")
+    if content ~= "" then
+      local clean_line = line:gsub("│ ", "  ")
+      table.insert(preprocessed_lines, clean_line)
+    end
+  end
+
+  for i = 1, #preprocessed_lines - 1 do
+    local current_line = preprocessed_lines[i]
+    local next_line = preprocessed_lines[i + 1]
+
+    if current_line:match("%S") and next_line:match("%S") then
+      local is_new = current_line:match('/%d+') == nil
+      local current_indent = #(current_line:match("^(%s*)") or "")
+      local next_indent = #(next_line:match("^(%s*)") or "")
+      local ends_with_slash = current_line:match("[/\\]%s*$") ~= nil
+
+      if is_new and next_indent > current_indent and not ends_with_slash then
+        local content, trailing = current_line:match("^(.-)(%s*)$")
+        preprocessed_lines[i] = content .. "/" .. trailing
+      end
+    end
+  end
+
   local seen_ids = {}
   local stack = { { path = instance.state.pseudo_root_path, depth = -1 } }
 
   local fs_actions = {}
   local transitions = {}
   local errors = {}
-  vim.iter(buf_lines):each(function(buf_line)
+  vim.iter(preprocessed_lines):each(function(buf_line)
     local id, name, depth, is_dir = H.parse_buf_line(buf_line)
     while #stack > 1 and stack[#stack].depth >= depth do
       table.remove(stack)
@@ -324,9 +402,193 @@ H.compute_fs_actions = function(instance, id_to_path, buf_lines)
     end
   end
 
+  local function normalize_path(p)
+    if not p then return "" end
+    p = libpath.to_os(p):gsub("\\", "/")
+    p = p:gsub("/+$", "")
+    return p
+  end
+
+  local function is_subpath(parent, child)
+    local n_parent = normalize_path(parent) .. "/"
+    local n_child = normalize_path(child) .. "/"
+    return n_child:sub(1, #n_parent) == n_parent
+  end
+
+  local function scan_dir_recursive(dir_path)
+    local paths = {}
+    local function scan(p)
+      local handle = vim.uv.fs_scandir(p)
+      if handle then
+        while true do
+          local name, type = vim.uv.fs_scandir_next(handle)
+          if not name then break end
+          local full = p .. "/" .. name
+          table.insert(paths, full)
+          if type == "directory" then
+            scan(full)
+          end
+        end
+      end
+    end
+    scan(libpath.to_os(dir_path))
+    return paths
+  end
+
+  -- Identify parent moves
+  local move_map = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "move" then
+      local stat = vim.uv.fs_stat(libpath.to_os(action.src))
+      if stat and stat.type == "directory" then
+        table.insert(move_map, action)
+      end
+    end
+  end
+
+  -- Clean deletes that are children of moved folders
+  local fs_actions_clean = {}
+  for _, action in ipairs(fs_actions) do
+    local keep = true
+    if action.name == "delete" then
+      for _, move in ipairs(move_map) do
+        if is_subpath(move.src, action.src) then
+          keep = false
+          break
+        end
+      end
+    end
+    if keep then
+      table.insert(fs_actions_clean, action)
+    end
+  end
+  fs_actions = fs_actions_clean
+
+  -- Scan and append extra move actions for child files/folders of moved folders
+  local extra_moves = {}
+  local existing_move_dsts = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "move" then
+      existing_move_dsts[normalize_path(action.dst)] = true
+    end
+  end
+
+  for _, move in ipairs(move_map) do
+    local child_paths = scan_dir_recursive(move.src)
+    local norm_src = normalize_path(move.src)
+    for _, child_src in ipairs(child_paths) do
+      local norm_child_src = normalize_path(child_src)
+      local rel = norm_child_src:sub(#norm_src + 2)
+      local child_dst = move.dst .. "/" .. rel
+      
+      if not existing_move_dsts[normalize_path(child_dst)] then
+        table.insert(extra_moves, {
+          name = "move",
+          src = child_src,
+          dst = child_dst
+        })
+        existing_move_dsts[normalize_path(child_dst)] = true
+      end
+    end
+  end
+
+  for _, action in ipairs(extra_moves) do
+    table.insert(fs_actions, action)
+  end
+
+  -- Identify parent deletes
+  local delete_dirs = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "delete" then
+      local stat = vim.uv.fs_stat(libpath.to_os(action.src))
+      if stat and stat.type == "directory" then
+        if action.src ~= instance.state.pseudo_root_path then
+          table.insert(delete_dirs, action.src)
+        end
+      end
+    end
+  end
+
+  -- Scan and append extra delete actions for child files/folders of deleted folders
+  local extra_deletes = {}
+  local existing_delete_srcs = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "delete" then
+      existing_delete_srcs[normalize_path(action.src)] = true
+    end
+  end
+
+  for _, parent_dir in ipairs(delete_dirs) do
+    local child_paths = scan_dir_recursive(parent_dir)
+    for _, child_src in ipairs(child_paths) do
+      if not existing_delete_srcs[normalize_path(child_src)] then
+        table.insert(extra_deletes, {
+          name = "delete",
+          src = child_src
+        })
+        existing_delete_srcs[normalize_path(child_src)] = true
+      end
+    end
+  end
+
+  for _, action in ipairs(extra_deletes) do
+    table.insert(fs_actions, action)
+  end
+
+  -- Track which paths have delete actions
+  local delete_map = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "delete" then
+      local norm_path = normalize_path(action.src)
+      delete_map[norm_path] = action
+    end
+  end
+
+  -- First pass: identify cancellations (delete + create of same type)
+  local cancelled = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "create" then
+      local norm_path = normalize_path(action.dst)
+      local matching_delete = delete_map[norm_path]
+      if matching_delete then
+        local stat = vim.uv.fs_stat(norm_path)
+        local is_delete_dir = stat and stat.type == "directory"
+        local is_create_dir = action.dst:match("[/\\]$") ~= nil
+        
+        if is_delete_dir == is_create_dir then
+          cancelled[action] = true
+          cancelled[matching_delete] = true
+        end
+      end
+    end
+  end
+
+  -- Second pass: build filtered actions list
+  local filtered_actions = {}
+  for _, action in ipairs(fs_actions) do
+    if not cancelled[action] then
+      local keep = true
+      if action.name == "create" then
+        local norm_path = normalize_path(action.dst)
+        if vim.uv.fs_stat(norm_path) and not delete_map[norm_path] then
+          keep = false
+        end
+      end
+      if keep then
+        table.insert(filtered_actions, action)
+      end
+    end
+  end
+
+  if #filtered_actions == 0 and #fs_actions > 0 then
+    vim.schedule(function()
+      instance:refresh({ recursive = true })
+    end)
+  end
+
   local seen = {}
-  fs_actions = vim
-    .iter(fs_actions)
+  filtered_actions = vim
+    .iter(filtered_actions)
     :filter(function(fs_action)
       if seen[H.build_fs_action_id(fs_action)] then return false end
       seen[H.build_fs_action_id(fs_action)] = true
@@ -334,7 +596,7 @@ H.compute_fs_actions = function(instance, id_to_path, buf_lines)
     end)
     :totable()
 
-  return fs_actions, errors
+  return filtered_actions, errors
 end
 
 ---@private
@@ -515,14 +777,130 @@ end
 
 ---@private
 ---@return table, integer, table
+-- Get indentation depth of a line
+local function get_line_depth(bufnr, lnum)
+  local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+  local count = 0
+  for _ in line:gmatch("│ ") do
+    count = count + 1
+  end
+  return count
+end
+
+-- Reconstruct path for a buffer line (handles unpersisted files/directories/renames)
+local function get_path_for_line(inst, lnum)
+  local bufnr = inst.buf_id
+  local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+  
+  -- Determine if it is a directory from its concealed ID or trailing slash
+  local has_id_dir = false
+  local id = line:match("/(%d+)")
+  if id then
+    local entry = state.store[tonumber(id)]
+    if entry then
+      has_id_dir = entry.type == "directory"
+    end
+  end
+
+  local count = get_line_depth(bufnr, lnum)
+  local content = line:sub(count * 4 + 1)
+  
+  -- Extract name by stripping concealed ID prefix and any preceding icons/spaces
+  local name
+  if id then
+    name = content:match("/%d+%s+(.*)$") or content:match("/%d+$") or content
+  else
+    name = content
+  end
+  name = name:gsub("^%s+", ""):gsub("%s+$", "")
+  
+  local is_dir = false
+  if name ~= "" then
+    local has_slash = line:match("[/\\]%s*$") ~= nil or name:match("[/\\]%s*$") ~= nil
+    is_dir = has_slash or has_id_dir
+    
+    if has_slash then
+      name = name:gsub("[/\\]%s*$", "")
+    end
+  else
+    is_dir = true
+  end
+
+  if name == "" then
+    if id then
+      is_dir = has_id_dir
+      if count == 0 then
+        local p = inst.state.pseudo_root_path:gsub("[/\\]+$", "")
+        return p, is_dir
+      else
+        for p = lnum - 1, 1, -1 do
+          local p_count = get_line_depth(bufnr, p)
+          if p_count == count - 1 then
+            local parent_path, _ = get_path_for_line(inst, p)
+            local res = parent_path:gsub("[/\\]+$", "")
+            return res, is_dir
+          end
+        end
+      end
+    end
+    local p = inst.state.pseudo_root_path:gsub("[/\\]+$", "")
+    return p, true
+  end
+
+  if count == 0 then
+    local path = libpath.do_join(inst.state.pseudo_root_path, name)
+    return path:gsub("[/\\]+$", ""), is_dir
+  end
+
+  -- Find parent line (first line above with depth = count - 1)
+  for p = lnum - 1, 1, -1 do
+    local p_count = get_line_depth(bufnr, p)
+    if p_count == count - 1 then
+      local parent_path, _ = get_path_for_line(inst, p)
+      local path = libpath.do_join(parent_path, name)
+      return path:gsub("[/\\]+$", ""), is_dir
+    end
+  end
+
+  local path = libpath.do_join(inst.state.pseudo_root_path, name)
+  return path:gsub("[/\\]+$", ""), is_dir
+end
+
+local function clean_line_for_yank(line)
+  return (line:gsub("/%d+%s", ""):gsub("/%d+$", ""))
+end
+
 H.render_tree = function(instance, flat)
+  -- Build parent_has_children_in_buffer cache
+  local parent_has_children = {}
+  local bufnr = instance.buf_id
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  for l = 1, #lines do
+    local p, _ = get_path_for_line(instance, l)
+    if p then
+      local parent = vim.fs.dirname(p)
+      if parent then
+        parent_has_children[parent] = true
+      end
+    end
+  end
+  instance._parent_has_children_in_buffer = parent_has_children
+
   local visible = {}
   local rows = {}
   local id_to_line = {}
 
   for _, item in ipairs(flat) do
-    if not libfs.is_hidden(item.path, instance.cache.ui.hidden_items) then
-      local children, name_col = H.build_fs_entry_ui(item)
+    local is_deleted = false
+    for del_path, _ in pairs(M.clipboard.deleted) do
+      if item.path == del_path or item.path:sub(1, #del_path + 1) == del_path .. '/' then
+        is_deleted = true
+        break
+      end
+    end
+
+    if not is_deleted and not libfs.is_hidden(item.path, instance.cache.ui.hidden_items) then
+      local children, name_col = H.build_fs_entry_ui(instance, item)
       item._name_col = name_col
       visible[#visible + 1] = item
       id_to_line[item.id] = #visible
@@ -735,6 +1113,42 @@ function Finder:mutate()
 
           util.buffer_set_option(self.buf_id, 'modified', false)
 
+          -- Update fyler_state paths for moved parent folders and their children
+          for _, action in ipairs(ordered_actions) do
+            if action.name == 'move' then
+              local src = action.src
+              local dst = action.dst
+              local src_prefix = src:gsub("[/\\]+$", "") .. "/"
+              local dst_prefix = dst:gsub("[/\\]+$", "") .. "/"
+              
+              for _, entry in pairs(state.store) do
+                if entry.path then
+                  local entry_path = entry.path:gsub("[/\\]+$", "")
+                  if entry_path == src:gsub("[/\\]+$", "") then
+                    entry.path = dst
+                    local k_old = libpath.to_key(src)
+                    local k_new = libpath.to_key(dst)
+                    state.store_path_id[k_new] = state.store_path_id[k_old]
+                    state.store_path_id[k_old] = nil
+                  elseif entry.path:sub(1, #src_prefix) == src_prefix then
+                    local rel = entry.path:sub(#src_prefix + 1)
+                    local old_path = entry.path
+                    entry.path = dst_prefix .. rel
+                    
+                    local k_old = libpath.to_key(old_path)
+                    local k_new = libpath.to_key(entry.path)
+                    state.store_path_id[k_new] = state.store_path_id[k_old]
+                    state.store_path_id[k_old] = nil
+                  end
+                end
+              end
+            end
+          end
+
+          M.clipboard.deleted = {}
+          M.clipboard.items = {}
+          M.clipboard.action = nil
+
           local cursor_target = nil
           for i = #ordered_actions, 1, -1 do
             local action = ordered_actions[i]
@@ -796,9 +1210,1242 @@ function Finder:mutate()
 end
 
 
+  local function set_fyler_hl()
+    vim.api.nvim_set_hl(0, "FylerIndentScope", { fg = "#c678dd", bold = true, default = true })
+    vim.api.nvim_set_hl(0, "SnacksIndent", { link = "FylerIndentGuide", default = true })
+  end
+
+  local function get_item_info_at_lnum(inst, lnum)
+    local bufnr = inst.buf_id
+    local path, is_dir = get_path_for_line(inst, lnum)
+    if not path then return nil end
+
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local target_depth = get_line_depth(bufnr, lnum)
+
+    local item_lines = { { lnum = lnum, text = lines[lnum] } }
+    for i = lnum + 1, #lines do
+      local d = get_line_depth(bufnr, i)
+      if d > target_depth then
+        table.insert(item_lines, { lnum = i, text = lines[i] })
+      else
+        break
+      end
+    end
+
+    return {
+      path = path,
+      is_dir = is_dir,
+      lines = item_lines,
+    }
+  end
+
+  local function toggle_clipboard(item_info, action)
+    if M.clipboard.action ~= action then
+      M.clipboard.action = action
+      M.clipboard.items = { item_info }
+    else
+      local found_idx = nil
+      for idx, item in ipairs(M.clipboard.items) do
+        if item.path == item_info.path then
+          found_idx = idx
+          break
+        end
+      end
+
+      if found_idx then
+        table.remove(M.clipboard.items, found_idx)
+        if #M.clipboard.items == 0 then
+          M.clipboard.action = nil
+        end
+      else
+        table.insert(M.clipboard.items, item_info)
+      end
+    end
+  end
+
+  local function get_unique_dst(src, dst_dir, current_paths)
+    local name = vim.fs.basename(src)
+    local dst = dst_dir .. "/" .. name
+    local uv_or_loop = vim.uv or vim.loop
+    
+    if not uv_or_loop.fs_stat(dst) and not current_paths[dst] then
+      return dst
+    end
+
+    local stem = name
+    local ext = ""
+    local stat = uv_or_loop.fs_stat(src)
+    local is_dir = stat and stat.type == "directory"
+    if not is_dir then
+      local dot_idx = name:match("^%.") and name:sub(2):find(".", 1, true)
+      if dot_idx then
+        dot_idx = dot_idx + 1
+        stem = name:sub(1, dot_idx - 1)
+        ext = name:sub(dot_idx)
+      elseif not name:match("^%.") then
+        local last_dot = name:find("%.[^%.]*$")
+        if last_dot then
+          stem = name:sub(1, last_dot - 1)
+          ext = name:sub(last_dot)
+        end
+      end
+    end
+
+    local counter = 1
+    while true do
+      local suffix = "_copy" .. (counter > 1 and tostring(counter) or "")
+      local new_name = stem .. suffix .. ext
+      local new_dst = dst_dir .. "/" .. new_name
+      if not uv_or_loop.fs_stat(new_dst) and not current_paths[new_dst] then
+        return new_dst
+      end
+      counter = counter + 1
+    end
+  end
+
+  local function prompt_duplicate_resolver(inst, items_to_paste, target_dir, on_resolve)
+    local buf = vim.api.nvim_create_buf(false, true)
+    local buffer_lines = {}
+    local pseudo_root = inst.state.pseudo_root_path
+    
+    for _, item in ipairs(items_to_paste) do
+      local rel_src = item.src
+      local rel_suggested = item.suggested
+      
+      if item.src:sub(1, #pseudo_root) == pseudo_root then
+        rel_src = item.src:sub(#pseudo_root + 2)
+        if rel_src == "" then rel_src = item.src end
+      end
+      if item.suggested:sub(1, #pseudo_root) == pseudo_root then
+        rel_suggested = item.suggested:sub(#pseudo_root + 2)
+        if rel_suggested == "" then rel_suggested = item.suggested end
+      end
+      
+      table.insert(buffer_lines, "duplicate " .. rel_src .. " -> " .. rel_suggested)
+    end
+    
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, buffer_lines)
+    
+    local width = math.floor(vim.o.columns * 0.8)
+    local height = math.min(#buffer_lines + 2, 15)
+    local row = math.floor((vim.o.lines - height) / 2)
+    local col = math.floor((vim.o.columns - width) / 2)
+    
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      width = width,
+      height = height,
+      row = row,
+      col = col,
+      border = "rounded",
+      title = " Resolve Duplicate Names (Ctrl-s to apply) ",
+      title_pos = "center",
+    })
+    
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = "fyler_duplicate_resolver"
+    
+    vim.keymap.set("n", "<C-s>", function()
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local resolved_items = {}
+      for idx, line in ipairs(lines) do
+        local rel_src, rel_dst = line:match("^duplicate%s+(.-)%s*->%s*(.-)%s*$")
+        if not rel_src or not rel_dst then
+          vim.notify("Invalid line format: " .. line, vim.log.levels.ERROR)
+          return
+        end
+        
+        local dst_path = rel_dst
+        if not (rel_dst:sub(1, 1) == "/" or rel_dst:match("^%a:")) then
+          dst_path = pseudo_root .. "/" .. rel_dst
+        end
+        
+        local orig_item = items_to_paste[idx]
+        table.insert(resolved_items, {
+          src = orig_item.src,
+          dst = dst_path,
+          is_dir = orig_item.is_dir,
+          item = orig_item.item,
+          is_internal = orig_item.is_internal,
+          is_system = orig_item.is_system,
+          name = orig_item.name,
+        })
+      end
+      
+      pcall(vim.api.nvim_win_close, win, true)
+      on_resolve(resolved_items)
+    end, { buffer = buf, silent = true, nowait = true })
+
+    vim.keymap.set("n", "<Esc>", function() pcall(vim.api.nvim_win_close, win, true) end, { buffer = buf, silent = true, nowait = true })
+    vim.keymap.set("n", "q", function() pcall(vim.api.nvim_win_close, win, true) end, { buffer = buf, silent = true, nowait = true })
+  end
+
+  local function apply_fyler_highlights(inst)
+    local bufnr = inst.buf_id
+    if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    if vim.bo[bufnr].filetype ~= "fyler_finder" then return end
+
+    local hl_ns = vim.api.nvim_create_namespace("fyler_folder_colors")
+    vim.api.nvim_buf_clear_namespace(bufnr, hl_ns, 0, -1)
+
+    vim.api.nvim_set_hl(0, "FylerDeletedVT", { fg = "#e06c75", bold = true, italic = true, default = true })
+    vim.api.nvim_set_hl(0, "FylerCopiedVT", { fg = "#98c379", italic = true, default = true })
+    vim.api.nvim_set_hl(0, "FylerMovedVT", { fg = "#e5c07b", italic = true, default = true })
+
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    
+    local id_counts = {}
+    for _, line in ipairs(lines) do
+      local id = line:match("/(%d+)")
+      if id then
+        local id_num = tonumber(id)
+        id_counts[id_num] = (id_counts[id_num] or 0) + 1
+      end
+    end
+
+    for id_num, _ in pairs(id_counts) do
+      local entry = state.store[id_num]
+      if entry and entry.path then
+        M.clipboard.deleted[entry.path] = nil
+      end
+    end
+
+    -- Identify implicit moves due to parent renames
+    local function is_implicit_move(path, entry_path)
+      if path == entry_path then return false end
+      local cur = path
+      local orig = entry_path
+      while true do
+        local parent_cur = vim.fs.dirname(cur)
+        local parent_orig = vim.fs.dirname(orig)
+        if not parent_cur or not parent_orig or parent_cur == cur or parent_orig == orig then
+          break
+        end
+        -- check if parent was moved
+        local p_id = state.store_path_id[libpath.to_key(parent_orig)]
+        if p_id then
+          local p_entry = state.store[p_id]
+          if p_entry and p_entry.path then
+            -- Find the current path of this parent in the buffer
+            local p_current_path = nil
+            for l = 1, #lines do
+              local line = lines[l]
+              if line:match("/" .. p_id .. "%s") or line:match("/" .. p_id .. "$") then
+                p_current_path = get_path_for_line(inst, l)
+                break
+              end
+            end
+            if p_current_path and p_current_path ~= p_entry.path then
+              local suffix = orig:sub(#parent_orig + 1)
+              if parent_cur .. suffix == cur and p_current_path .. suffix == cur then
+                return true
+              end
+            end
+          end
+        end
+        cur = parent_cur
+        orig = parent_orig
+      end
+      return false
+    end
+
+    for i, line in ipairs(lines) do
+      local current_path, is_dir = get_path_for_line(inst, i)
+      if current_path then
+        local vt_chunks = {}
+        if is_dir then
+          local count = get_line_depth(bufnr, i)
+          local start_col = count * 4
+          local is_empty = true
+          if inst._parent_has_children_in_buffer and inst._parent_has_children_in_buffer[current_path] then
+            is_empty = false
+          else
+            local uv = vim.uv or vim.loop
+            local scan_path = current_path
+            local id = line:match("/(%d+)")
+            if id then
+              local entry = state.store[tonumber(id)]
+              if entry and entry.path and entry.type == "directory" then
+                if not uv.fs_stat(scan_path) then
+                  scan_path = entry.path
+                end
+              end
+            end
+
+            local handle = uv.fs_scandir(scan_path)
+            if handle then
+              while true do
+                local name, _ = uv.fs_scandir_next(handle)
+                if not name then break end
+                local child_path = scan_path .. "/" .. name
+                local check_path = child_path
+                if scan_path ~= current_path then
+                  check_path = current_path .. "/" .. name
+                end
+                if not M.clipboard.deleted[check_path] then
+                  is_empty = false
+                  break
+                end
+              end
+            end
+          end
+
+          local key_path = current_path
+          local id = line:match("/(%d+)")
+          if id then
+            local entry = state.store[tonumber(id)]
+            if entry and entry.path and entry.type == "directory" then
+              key_path = entry.path
+            end
+          end
+          local is_expanded = inst.state.meta[libpath.to_key(key_path)] == true
+
+          local new_icon
+          if is_empty then
+            new_icon = is_expanded and "" or ""
+          else
+            new_icon = is_expanded and "" or ""
+          end
+
+          local after_guides = line:sub(count * 4 + 1)
+          local icon_char, rest = after_guides:match("^(%S+)%s+(.*)$")
+          if icon_char and icon_char:sub(1, 1) == "/" then
+            rest = after_guides
+            icon_char = ""
+          end
+
+          if icon_char and icon_char ~= new_icon then
+            local new_line = line:sub(1, count * 4) .. new_icon .. " " .. rest
+            if new_line ~= line then
+              vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, { new_line })
+              line = new_line
+            end
+          end
+
+          pcall(vim.api.nvim_buf_set_extmark, bufnr, hl_ns, i - 1, start_col, {
+            end_row = i - 1,
+            end_col = #line,
+            hl_group = "FylerDirectoryName",
+            priority = 100,
+            hl_mode = "combine",
+          })
+
+          local deleted_count = 0
+          for del_path, _ in pairs(M.clipboard.deleted) do
+            local parent_path = vim.fs.dirname(del_path)
+            if parent_path == current_path then
+              deleted_count = deleted_count + 1
+            end
+          end
+
+          if deleted_count > 0 then
+            table.insert(vt_chunks, { " (deleted: " .. deleted_count .. ")", "FylerDeletedVT" })
+          end
+        end
+
+        local id = line:match("/(%d+)")
+        if id then
+          local id_num = tonumber(id)
+          local entry = state.store[id_num]
+          if entry and entry.path and current_path ~= entry.path then
+            local rel_orig = entry.path
+            local pseudo_root = inst.state.pseudo_root_path
+            if entry.path:sub(1, #pseudo_root) == pseudo_root then
+              rel_orig = entry.path:sub(#pseudo_root + 2)
+              if rel_orig == "" then rel_orig = entry.path end
+            end
+
+            if not is_implicit_move(current_path, entry.path) then
+              if id_counts[id_num] > 1 then
+                local current_name = vim.fs.basename(current_path)
+                local original_name = vim.fs.basename(entry.path)
+                if current_name ~= original_name then
+                  table.insert(vt_chunks, { " (copied and renamed from " .. rel_orig .. ")", "FylerCopiedVT" })
+                else
+                  table.insert(vt_chunks, { " (copied from " .. rel_orig .. ")", "FylerCopiedVT" })
+                end
+              else
+                local current_dir = vim.fs.dirname(current_path)
+                local original_dir = vim.fs.dirname(entry.path)
+                if current_dir == original_dir then
+                  local original_name = vim.fs.basename(entry.path)
+                  table.insert(vt_chunks, { " (renamed from " .. original_name .. ")", "FylerMovedVT" })
+                else
+                  table.insert(vt_chunks, { " (moved from " .. rel_orig .. ")", "FylerMovedVT" })
+                end
+              end
+            end
+          end
+        end
+
+        if #vt_chunks > 0 then
+          pcall(vim.api.nvim_buf_set_extmark, bufnr, hl_ns, i - 1, #line, {
+            virt_text = vt_chunks,
+            virt_text_pos = "eol",
+          })
+        end
+      end
+    end
+  end
+
+  local function update_fyler_clipboard_highlights(inst)
+    local bufnr = inst.buf_id
+    if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    if vim.bo[bufnr].filetype ~= "fyler_finder" then return end
+
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    for i = 1, #lines do
+      local path, _ = get_path_for_line(inst, i)
+      if path then
+        M.clipboard.deleted[path] = nil
+      end
+    end
+
+    local clipboard_ns = vim.api.nvim_create_namespace("fyler_clipboard_items")
+    vim.api.nvim_buf_clear_namespace(bufnr, clipboard_ns, 0, -1)
+
+    if not M.clipboard.items or #M.clipboard.items == 0 then
+      return
+    end
+
+    local clipboard_map = {}
+    for _, item in ipairs(M.clipboard.items) do
+      clipboard_map[item.path] = true
+    end
+
+    vim.api.nvim_set_hl(0, "FylerCopied", { undercurl = true, sp = "#98c379", default = true })
+    vim.api.nvim_set_hl(0, "FylerCut", { fg = "#e06c75", strikethrough = true, default = true })
+
+    local hl_group = M.clipboard.action == "copy" and "FylerCopied" or "FylerCut"
+
+    for i = 1, #lines do
+      local path, _ = get_path_for_line(inst, i)
+      if path and clipboard_map[path] then
+        local count = get_line_depth(bufnr, i)
+        local indent_len = count * 4
+
+        local line = lines[i] or ""
+        if #line > indent_len then
+          pcall(vim.api.nvim_buf_set_extmark, bufnr, clipboard_ns, i - 1, indent_len, {
+            end_row = i - 1,
+            end_col = #line,
+            hl_group = hl_group,
+            priority = 10000,
+            hl_mode = "combine",
+          })
+        end
+      end
+    end
+  end
+
+  local function update_fyler_indent_scope(inst)
+    local bufnr = inst.buf_id
+    if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    if vim.bo[bufnr].filetype ~= "fyler_finder" then return end
+    set_fyler_hl()
+
+    local scope_ns = vim.api.nvim_create_namespace("fyler_indent_scope")
+    vim.api.nvim_buf_clear_namespace(bufnr, scope_ns, 0, -1)
+
+    local win_id = inst.win_id
+    if not win_id or not vim.api.nvim_win_is_valid(win_id) then return end
+    local cursor = vim.api.nvim_win_get_cursor(win_id)
+    local lnum = cursor[1]
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+    local count = get_line_depth(bufnr, lnum)
+    if count == 0 then return end
+
+    local start_lnum = lnum
+    for l = lnum - 1, 1, -1 do
+      if get_line_depth(bufnr, l) < count then
+        start_lnum = l
+        break
+      end
+    end
+
+    local end_lnum = lnum
+    for l = lnum + 1, line_count do
+      if get_line_depth(bufnr, l) >= count then
+        end_lnum = l
+      else
+        break
+      end
+    end
+
+    local start_col = (count - 1) * 4
+    local end_col = start_col + 3
+    local hl = "FylerIndentScope"
+
+    for l = start_lnum + 1, end_lnum do
+      pcall(vim.api.nvim_buf_set_extmark, bufnr, scope_ns, l - 1, start_col, {
+        end_row = l - 1,
+        end_col = end_col,
+        hl_group = hl,
+        priority = 9999,
+        hl_mode = "replace",
+      })
+    end
+  end
+
+  local function update_fyler_unsaved_lines(inst)
+    local bufnr = inst.buf_id
+    if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    if vim.bo[bufnr].filetype ~= "fyler_finder" then return end
+
+    local unsaved_ns = vim.api.nvim_create_namespace("fyler_unsaved_changes")
+    vim.api.nvim_buf_clear_namespace(bufnr, unsaved_ns, 0, -1)
+
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    for i, line in ipairs(lines) do
+      if line:match("%S") then
+        local has_id = line:match('/%d+') ~= nil
+        if not has_id then
+          local count = get_line_depth(bufnr, i)
+          local indent_len = count * 4
+
+          if indent_len > 0 then
+            pcall(vim.api.nvim_buf_set_extmark, bufnr, unsaved_ns, i - 1, 0, {
+              end_row = i - 1,
+              end_col = indent_len,
+              hl_group = "SnacksIndent",
+              priority = 1000,
+            })
+          end
+
+          vim.api.nvim_set_hl(0, "FylerUnsaved", { fg = "#98c379", bold = true, default = true })
+
+          if #line > indent_len then
+            pcall(vim.api.nvim_buf_set_extmark, bufnr, unsaved_ns, i - 1, indent_len, {
+              end_row = i - 1,
+              end_col = #line,
+              hl_group = "FylerUnsaved",
+              priority = 1000,
+            })
+          end
+        end
+      end
+    end
+  end
+
+  local function setup_buffer_mappings(self)
+    local bufnr = self.buf_id
+
+    vim.keymap.set("n", "<C-z>", "u", { buffer = bufnr, silent = true, nowait = true })
+
+    vim.keymap.set("n", "<Esc>", function()
+      M.clipboard.items = {}
+      M.clipboard.action = nil
+      update_fyler_clipboard_highlights(self)
+    end, { buffer = bufnr, silent = true, nowait = true })
+
+    vim.keymap.set("n", "<C-s>", function()
+      _G.fyler_cs_save = true
+      vim.cmd("write")
+    end, { buffer = bufnr, silent = true, nowait = true })
+
+    -- Copy in normal mode
+    vim.keymap.set("n", "c", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local item_info = get_item_info_at_lnum(self, lnum)
+      if item_info then
+        toggle_clipboard(item_info, "copy")
+        update_fyler_clipboard_highlights(self)
+        local yank_lines = {}
+        for _, line_info in ipairs(item_info.lines) do
+          table.insert(yank_lines, clean_line_for_yank(line_info.text))
+        end
+        if #yank_lines > 0 then
+          local yank_text = table.concat(yank_lines, "\n")
+          vim.fn.setreg("+", yank_text)
+          vim.fn.setreg('"', yank_text)
+        end
+      end
+    end, { buffer = bufnr, silent = true, nowait = true })
+    vim.keymap.set("n", "<C-c>", "c", { buffer = bufnr, silent = true, remap = true, nowait = true })
+
+    -- Cut in normal mode
+    vim.keymap.set("n", "x", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local item_info = get_item_info_at_lnum(self, lnum)
+      if item_info then
+        toggle_clipboard(item_info, "move")
+        update_fyler_clipboard_highlights(self)
+      end
+    end, { buffer = bufnr, silent = true, nowait = true })
+    vim.keymap.set("n", "<C-x>", "x", { buffer = bufnr, silent = true, remap = true, nowait = true })
+
+    -- Copy in visual mode
+    vim.keymap.set("v", "c", function()
+      local start_line = vim.fn.line("v")
+      local end_line = vim.fn.line(".")
+      if start_line > end_line then
+        start_line, end_line = end_line, start_line
+      end
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+
+      local top_level_lnums = {}
+      local last_included_depth = -1
+      local last_included_lnum = -1
+      for l = start_line, end_line do
+        local line_depth = get_line_depth(bufnr, l)
+        if last_included_lnum == -1 then
+          table.insert(top_level_lnums, l)
+          last_included_lnum = l
+          last_included_depth = line_depth
+        else
+          local is_child = false
+          if l > last_included_lnum then
+            local all_greater = true
+            for check_l = last_included_lnum + 1, l do
+              local cd = get_line_depth(bufnr, check_l)
+              if cd <= last_included_depth then
+                all_greater = false
+                break
+              end
+            end
+            if all_greater then
+              is_child = true
+            end
+          end
+          if not is_child then
+            table.insert(top_level_lnums, l)
+            last_included_lnum = l
+            last_included_depth = line_depth
+          end
+        end
+      end
+
+      for _, l in ipairs(top_level_lnums) do
+        local item_info = get_item_info_at_lnum(self, l)
+        if item_info then
+          toggle_clipboard(item_info, "copy")
+        end
+      end
+      update_fyler_clipboard_highlights(self)
+      local selected_lines = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, end_line, false)
+      local yank_lines = {}
+      for _, line in ipairs(selected_lines) do
+        table.insert(yank_lines, clean_line_for_yank(line))
+      end
+      if #yank_lines > 0 then
+        local yank_text = table.concat(yank_lines, "\n")
+        vim.fn.setreg("+", yank_text)
+        vim.fn.setreg('"', yank_text)
+      end
+    end, { buffer = bufnr, silent = true, nowait = true })
+    vim.keymap.set("v", "<C-c>", "c", { buffer = bufnr, silent = true, remap = true, nowait = true })
+
+    -- Cut in visual mode
+    vim.keymap.set("v", "x", function()
+      local start_line = vim.fn.line("v")
+      local end_line = vim.fn.line(".")
+      if start_line > end_line then
+        start_line, end_line = end_line, start_line
+      end
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+
+      local top_level_lnums = {}
+      local last_included_depth = -1
+      local last_included_lnum = -1
+      for l = start_line, end_line do
+        local line_depth = get_line_depth(bufnr, l)
+        if last_included_lnum == -1 then
+          table.insert(top_level_lnums, l)
+          last_included_lnum = l
+          last_included_depth = line_depth
+        else
+          local is_child = false
+          if l > last_included_lnum then
+            local all_greater = true
+            for check_l = last_included_lnum + 1, l do
+              local cd = get_line_depth(bufnr, check_l)
+              if cd <= last_included_depth then
+                all_greater = false
+                break
+              end
+            end
+            if all_greater then
+              is_child = true
+            end
+          end
+          if not is_child then
+            table.insert(top_level_lnums, l)
+            last_included_lnum = l
+            last_included_depth = line_depth
+          end
+        end
+      end
+
+      for _, l in ipairs(top_level_lnums) do
+        local item_info = get_item_info_at_lnum(self, l)
+        if item_info then
+          toggle_clipboard(item_info, "move")
+        end
+      end
+      update_fyler_clipboard_highlights(self)
+    end, { buffer = bufnr, silent = true, nowait = true })
+    vim.keymap.set("v", "<C-x>", "x", { buffer = bufnr, silent = true, remap = true, nowait = true })
+
+    -- Paste in normal mode
+    vim.keymap.set("n", "p", function()
+      local target_lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local item_path, is_target_dir = get_path_for_line(self, target_lnum)
+      local target_dir
+      local target_depth
+      local insert_after_lnum
+
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      if #lines == 0 then
+        target_depth = 0
+        insert_after_lnum = 0
+        target_dir = self.state.pseudo_root_path
+      else
+        local line_depth = get_line_depth(bufnr, target_lnum)
+        if is_target_dir then
+          target_depth = line_depth + 1
+          target_dir = item_path
+          insert_after_lnum = target_lnum
+          for i = target_lnum + 1, #lines do
+            local d = get_line_depth(bufnr, i)
+            if d >= target_depth then
+              insert_after_lnum = i
+            else
+              break
+            end
+          end
+        else
+          target_depth = line_depth
+          target_dir = vim.fs.dirname(item_path)
+          insert_after_lnum = target_lnum
+        end
+      end
+
+      local current_paths = {}
+      for i = 1, #lines do
+        local p, _ = get_path_for_line(self, i)
+        if p then current_paths[p] = true end
+      end
+
+      local is_internal = M.clipboard.items and #M.clipboard.items > 0
+      local system_lines = {}
+      if not is_internal then
+        local reg_content = vim.fn.getreg("+")
+        if reg_content == "" then reg_content = vim.fn.getreg('"') end
+        if reg_content ~= "" then
+          for s in reg_content:gmatch("[^\r\n]+") do
+            local clean = s:gsub("^%s+", ""):gsub("%s+$", "")
+            if clean ~= "" then table.insert(system_lines, clean) end
+          end
+        end
+      end
+
+      if not is_internal and #system_lines == 0 then return end
+
+      local items_to_paste = {}
+      local has_collision = false
+      
+      if is_internal then
+        for _, item in ipairs(M.clipboard.items) do
+          local name = vim.fs.basename(item.path)
+          local default_dst = target_dir .. "/" .. name
+          local collides = vim.uv.fs_stat(default_dst) ~= nil or current_paths[default_dst]
+          if collides then has_collision = true end
+          
+          local suggested_dst = get_unique_dst(item.path, target_dir, current_paths)
+          current_paths[suggested_dst] = true
+          
+          table.insert(items_to_paste, {
+            src = item.path,
+            suggested = suggested_dst,
+            is_dir = item.is_dir,
+            item = item,
+            is_internal = true,
+          })
+        end
+      else
+        for _, clean in ipairs(system_lines) do
+          local clean_name = clean
+          if clean_name:sub(-1) == "/" or clean_name:sub(-1) == "\\" then
+            clean_name = clean_name:sub(1, -2)
+          end
+          local default_dst = target_dir .. "/" .. clean_name
+          local collides = vim.uv.fs_stat(default_dst) ~= nil or current_paths[default_dst]
+          if collides then has_collision = true end
+          
+          local suggested_dst = get_unique_dst(default_dst, target_dir, current_paths)
+          current_paths[suggested_dst] = true
+          
+          table.insert(items_to_paste, {
+            src = default_dst,
+            suggested = suggested_dst,
+            is_dir = clean:match("[/\\]%s*$") ~= nil,
+            name = clean,
+            is_system = true,
+          })
+        end
+      end
+
+      local function do_paste(resolved_items)
+        local actual_current_paths = {}
+        for i = 1, #lines do
+          local p, _ = get_path_for_line(self, i)
+          if p then actual_current_paths[p] = true end
+        end
+
+        if is_internal then
+          local delete_set = {}
+          if M.clipboard.action == "move" then
+            for _, item in ipairs(M.clipboard.items) do
+              for _, line_info in ipairs(item.lines) do
+                delete_set[line_info.lnum] = true
+              end
+            end
+          end
+
+          local new_lines = {}
+          for _, resolved in ipairs(resolved_items) do
+            local item = resolved.item
+            local orig_top_line = item.lines[1].text
+            local orig_top_depth = get_line_depth(bufnr, item.lines[1].lnum)
+
+            local id_prefix, orig_name = orig_top_line:match("/(%d+)%s+(.-)$")
+            if not id_prefix then
+              orig_name = orig_top_line:sub(orig_top_depth * 4 + 1):gsub("^%s+", ""):gsub("%s+$", "")
+            end
+            
+            local is_item_dir = orig_name:match("[/\\]%s*$") ~= nil or (id_prefix and item.is_dir)
+            
+            local unique_dst = resolved.dst
+            actual_current_paths[unique_dst] = true
+            M.clipboard.deleted[unique_dst] = nil
+            
+            local dst_name = vim.fs.basename(unique_dst)
+            if is_item_dir then dst_name = dst_name .. "/" end
+
+            for _, line_info in ipairs(item.lines) do
+              local d = get_line_depth(bufnr, line_info.lnum)
+              local depth_diff = d - orig_top_depth
+              local new_depth = target_depth + depth_diff
+              local prefix = string.rep("│ ", new_depth)
+
+              local line_id = line_info.text:match("/(%d+)")
+              local line_name
+              if line_info.lnum == item.lines[1].lnum then
+                line_name = dst_name
+              else
+                local child_id, child_name = line_info.text:match("/(%d+)%s+(.-)$")
+                if child_id then
+                  line_name = child_name
+                else
+                  local child_depth = get_line_depth(bufnr, line_info.lnum)
+                  line_name = line_info.text:sub(child_depth * 4 + 1):gsub("^%s+", ""):gsub("%s+$", "")
+                end
+              end
+
+              local formatted_line
+              if line_id then
+                formatted_line = prefix .. "/" .. line_id .. " " .. line_name
+              else
+                formatted_line = prefix .. line_name
+              end
+              table.insert(new_lines, formatted_line)
+            end
+          end
+
+          local final_lines = {}
+          if insert_after_lnum == 0 then
+            for _, nl in ipairs(new_lines) do table.insert(final_lines, nl) end
+          end
+
+          for i = 1, #lines do
+            local is_deleted = delete_set[i]
+            if not is_deleted then table.insert(final_lines, lines[i]) end
+            if i == insert_after_lnum then
+              for _, nl in ipairs(new_lines) do table.insert(final_lines, nl) end
+            end
+          end
+
+          vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
+
+          M.clipboard.items = {}
+          M.clipboard.action = nil
+          update_fyler_clipboard_highlights(self)
+
+          local new_cursor_lnum = insert_after_lnum + 1
+          local deleted_before_insert = 0
+          for lnum_del, _ in pairs(delete_set) do
+            if lnum_del <= insert_after_lnum then
+              deleted_before_insert = deleted_before_insert + 1
+            end
+          end
+          new_cursor_lnum = math.max(1, new_cursor_lnum - deleted_before_insert)
+          pcall(vim.api.nvim_win_set_cursor, self.win_id, { new_cursor_lnum, 0 })
+        else
+          local new_lines = {}
+          for _, resolved in ipairs(resolved_items) do
+            local prefix = string.rep("│ ", target_depth)
+            local clean = resolved.name
+            local clean_name = clean
+            if clean_name:sub(-1) == "/" or clean_name:sub(-1) == "\\" then
+              clean_name = clean_name:sub(1, -2)
+            end
+            
+            local dst_name = vim.fs.basename(resolved.dst)
+            if resolved.is_dir then dst_name = dst_name .. "/" end
+            table.insert(new_lines, prefix .. dst_name)
+          end
+
+          local final_lines = {}
+          if insert_after_lnum == 0 then
+            for _, nl in ipairs(new_lines) do table.insert(final_lines, nl) end
+          end
+
+          for i = 1, #lines do
+            table.insert(final_lines, lines[i])
+            if i == insert_after_lnum then
+              for _, nl in ipairs(new_lines) do table.insert(final_lines, nl) end
+            end
+          end
+
+          vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
+
+          local new_cursor_lnum = insert_after_lnum + 1
+          pcall(vim.api.nvim_win_set_cursor, self.win_id, { new_cursor_lnum, 0 })
+        end
+      end
+
+      if has_collision then
+        prompt_duplicate_resolver(self, items_to_paste, target_dir, do_paste)
+      else
+        local resolved_items = {}
+        for _, item in ipairs(items_to_paste) do
+          table.insert(resolved_items, {
+            src = item.src,
+            dst = item.suggested,
+            is_dir = item.is_dir,
+            item = item.item,
+            is_internal = item.is_internal,
+            is_system = item.is_system,
+            name = item.name,
+          })
+        end
+        do_paste(resolved_items)
+      end
+    end, { buffer = bufnr, silent = true, nowait = true })
+    vim.keymap.set("n", "<C-v>", "p", { buffer = bufnr, silent = true, remap = true, nowait = true })
+
+    -- Delete in normal mode
+    vim.keymap.set("n", "dd", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      if #lines == 0 then return end
+
+      local target_depth = get_line_depth(bufnr, lnum)
+      local delete_set = { [lnum] = true }
+      for i = lnum + 1, #lines do
+        local d = get_line_depth(bufnr, i)
+        if d > target_depth then
+          delete_set[i] = true
+        else
+          break
+        end
+      end
+
+      for l_del, _ in pairs(delete_set) do
+        local p, _ = get_path_for_line(self, l_del)
+        local del_line = lines[l_del] or ""
+        local id = del_line:match("/(%d+)")
+        local is_persisted = false
+        if id and p then
+          local id_num = tonumber(id)
+          local entry = state.store[id_num]
+          if entry and entry.path then
+            if p == entry.path then
+              is_persisted = true
+            else
+              local occurrences = 0
+              for _, line in ipairs(lines) do
+                if line:match("/" .. id_num .. "%s") or line:match("/" .. id_num .. "$") then
+                  occurrences = occurrences + 1
+                end
+              end
+              if occurrences == 1 then is_persisted = true end
+            end
+          end
+        end
+        if is_persisted then M.clipboard.deleted[p] = true end
+      end
+
+      local final_lines = {}
+      for i = 1, #lines do
+        if not delete_set[i] then table.insert(final_lines, lines[i]) end
+      end
+
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
+
+      local new_lnum = math.min(lnum, #final_lines)
+      if new_lnum > 0 then pcall(vim.api.nvim_win_set_cursor, self.win_id, { new_lnum, 0 }) end
+      update_fyler_clipboard_highlights(self)
+    end, { buffer = bufnr, silent = true, nowait = true })
+
+    -- Delete in visual mode
+    vim.keymap.set("v", "d", function()
+      local start_line = vim.fn.line("v")
+      local end_line = vim.fn.line(".")
+      if start_line > end_line then
+        start_line, end_line = end_line, start_line
+      end
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      if #lines == 0 then return end
+
+      local delete_set = {}
+      for l = start_line, end_line do
+        delete_set[l] = true
+        local depth = get_line_depth(bufnr, l)
+        for i = l + 1, #lines do
+          local d = get_line_depth(bufnr, i)
+          if d > depth then
+            delete_set[i] = true
+          else
+            break
+          end
+        end
+      end
+
+      for l_del, _ in pairs(delete_set) do
+        local p, _ = get_path_for_line(self, l_del)
+        local del_line = lines[l_del] or ""
+        local id = del_line:match("/(%d+)")
+        local is_persisted = false
+        if id and p then
+          local id_num = tonumber(id)
+          local entry = state.store[id_num]
+          if entry and entry.path then
+            if p == entry.path then
+              is_persisted = true
+            else
+              local occurrences = 0
+              for _, line in ipairs(lines) do
+                if line:match("/" .. id_num .. "%s") or line:match("/" .. id_num .. "$") then
+                  occurrences = occurrences + 1
+                end
+              end
+              if occurrences == 1 then is_persisted = true end
+            end
+          end
+        end
+        if is_persisted then M.clipboard.deleted[p] = true end
+      end
+
+      local final_lines = {}
+      for i = 1, #lines do
+        if not delete_set[i] then table.insert(final_lines, lines[i]) end
+      end
+
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
+
+      local new_lnum = math.min(start_line, #final_lines)
+      if new_lnum > 0 then pcall(vim.api.nvim_win_set_cursor, self.win_id, { new_lnum, 0 }) end
+      update_fyler_clipboard_highlights(self)
+    end, { buffer = bufnr, silent = true, nowait = true })
+
+    -- 'o' in normal mode
+    vim.keymap.set("n", "o", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      local count = 0
+      for _ in line:gmatch("│ ") do count = count + 1 end
+      local indent = string.rep("│ ", count)
+      vim.api.nvim_buf_set_lines(bufnr, lnum, lnum, false, { indent })
+      vim.api.nvim_win_set_cursor(self.win_id, { lnum + 1, #indent })
+      vim.cmd("startinsert!")
+    end, { buffer = bufnr, silent = true })
+
+    -- 'O' in normal mode
+    vim.keymap.set("n", "O", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      local count = 0
+      for _ in line:gmatch("│ ") do count = count + 1 end
+      local indent = string.rep("│ ", count)
+      vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum - 1, false, { indent })
+      vim.api.nvim_win_set_cursor(self.win_id, { lnum, #indent })
+      vim.cmd("startinsert!")
+    end, { buffer = bufnr, silent = true })
+
+    -- Replace current line ('rr')
+    local function replace_current_line()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      local id = line:match("/(%d+)")
+      local prefix
+      if id then
+        prefix = line:match("^([%s%S]*/" .. id .. "%s+)")
+      else
+        prefix = line:match("^([│ \t]*%S+%s+)")
+      end
+      if not prefix then
+        local count = 0
+        for _ in line:gmatch("│ ") do count = count + 1 end
+        prefix = string.rep("│ ", count)
+      end
+      vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum, false, { prefix })
+      vim.api.nvim_win_set_cursor(self.win_id, { lnum, #prefix })
+      vim.cmd("startinsert!")
+    end
+    vim.keymap.set("n", "rr", replace_current_line, { buffer = bufnr, silent = true })
+
+    -- '<BS>' in insert mode
+    vim.keymap.set("i", "<BS>", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+
+      local min_col
+      local id = line:match("/(%d+)")
+      if id then
+        local prefix = line:match("^[%s%S]*/%" .. id .. "%s+")
+        min_col = prefix and #prefix or 0
+      else
+        local prefix = line:match("^([│ \t]*%S+%s+)")
+        min_col = prefix and #prefix or 0
+      end
+
+      if col <= min_col then return end
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<BS>", true, false, true), "n", false)
+    end, { buffer = bufnr, silent = true })
+
+    -- '<CR>' in insert mode
+    vim.keymap.set("i", "<CR>", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+
+      local count = 0
+      for _ in line:gmatch("│ ") do count = count + 1 end
+      local indent = string.rep("│ ", count)
+
+      local before = line:sub(1, col)
+      local after = line:sub(col + 1)
+
+      vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum, false, { before })
+      vim.api.nvim_buf_set_lines(bufnr, lnum, lnum, false, { indent .. after })
+      vim.api.nvim_win_set_cursor(self.win_id, { lnum + 1, #indent })
+    end, { buffer = bufnr, silent = true })
+
+    -- Indent (Tab) in normal mode
+    vim.keymap.set("n", "<Tab>", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum, false, { "│ " .. line })
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      vim.api.nvim_win_set_cursor(self.win_id, { cursor[1], cursor[2] + 4 })
+    end, { buffer = bufnr, silent = true })
+
+    -- Deindent (S-Tab) in normal mode
+    vim.keymap.set("n", "<S-Tab>", function()
+      local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      if line:sub(1, 4) == "│ " then
+        vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum, false, { line:sub(5) })
+        local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+        vim.api.nvim_win_set_cursor(self.win_id, { cursor[1], math.max(0, cursor[2] - 4) })
+      end
+    end, { buffer = bufnr, silent = true })
+
+    -- Indent (Tab) in insert mode
+    vim.keymap.set("i", "<Tab>", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum, false, { "│ " .. line })
+      vim.api.nvim_win_set_cursor(self.win_id, { lnum, col + 4 })
+    end, { buffer = bufnr, silent = true })
+
+    -- Deindent (S-Tab) in insert mode
+    vim.keymap.set("i", "<S-Tab>", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      if line:sub(1, 4) == "│ " then
+        vim.api.nvim_buf_set_lines(bufnr, lnum - 1, lnum, false, { line:sub(5) })
+        vim.api.nvim_win_set_cursor(self.win_id, { lnum, math.max(0, col - 4) })
+      end
+    end, { buffer = bufnr, silent = true })
+
+    -- Sibling navigation 'gj' and 'gk'
+    vim.keymap.set("n", "gj", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+      local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+      local target_depth = get_line_depth(bufnr, lnum)
+      for l = lnum + 1, line_count do
+        local d = get_line_depth(bufnr, l)
+        if d == target_depth then
+          vim.api.nvim_win_set_cursor(self.win_id, { l, col })
+          break
+        elseif d < target_depth then
+          break
+        end
+      end
+    end, { buffer = bufnr, silent = true })
+
+    vim.keymap.set("n", "gk", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+
+      local target_depth = get_line_depth(bufnr, lnum)
+      for l = lnum - 1, 1, -1 do
+        local d = get_line_depth(bufnr, l)
+        if d == target_depth then
+          vim.api.nvim_win_set_cursor(self.win_id, { l, col })
+          break
+        elseif d < target_depth then
+          break
+        end
+      end
+    end, { buffer = bufnr, silent = true })
+
+    vim.keymap.set("n", "gp", function()
+      local cursor = vim.api.nvim_win_get_cursor(self.win_id)
+      local lnum = cursor[1]
+      local col = cursor[2]
+
+      local count = get_line_depth(bufnr, lnum)
+      if count > 0 then
+        local target_depth = count - 1
+        for l = lnum - 1, 1, -1 do
+          if get_line_depth(bufnr, l) == target_depth then
+            local line = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
+            vim.api.nvim_win_set_cursor(self.win_id, { l, math.min(col, #line) })
+            break
+          end
+        end
+      end
+    end, { buffer = bufnr, silent = true })
+  end
+
 function Finder:open()
+  M.clipboard.action = nil
+  M.clipboard.items = {}
+  M.clipboard.deleted = {}
+
   if util.window_is_valid(self.win_id) then
     util.window_focus(self.win_id)
+    self:refresh({ force = true, recursive = true })
     return
   end
 
@@ -877,6 +2524,9 @@ function Finder:open()
         extensions.run_hook('finder_close_post', self)
         self._refresh_count = nil
         self._pending_refresh = nil
+        M.clipboard.action = nil
+        M.clipboard.items = {}
+        M.clipboard.deleted = {}
       end
     end)
   end, 'Detect buffer deletion')
@@ -890,6 +2540,9 @@ function Finder:open()
     extensions.run_hook('finder_close_post', self)
     self._refresh_count = nil
     self._pending_refresh = nil
+    M.clipboard.action = nil
+    M.clipboard.items = {}
+    M.clipboard.deleted = {}
   end, 'Clean up on buffer wipeout')
   au('BufWriteCmd', function() self:mutate() end, 'Ensure buffer saves')
   au('VimResized', function() self:resize() end, 'Ensure resize')
@@ -904,6 +2557,18 @@ function Finder:open()
       if pos[2] < id_end then vim.api.nvim_win_set_cursor(self.win_id, { pos[1], id_end }) end
     end, 'Ensure cursor boundary')
   end
+
+  setup_buffer_mappings(self)
+
+  au({ 'CursorMoved', 'BufEnter' }, function()
+    update_fyler_indent_scope(self)
+  end, 'Update indent scope guides')
+
+  au({ 'TextChanged', 'TextChangedI', 'BufEnter' }, function()
+    apply_fyler_highlights(self)
+    update_fyler_clipboard_highlights(self)
+    update_fyler_unsaved_lines(self)
+  end, 'Update highlights and unsaved lines')
 
   vim.cmd.tcd({ args = { vim.fn.fnameescape(self.opts.root_path) }, mods = { silent = true } })
   local target_path = vim.fn.bufname('#')
@@ -945,6 +2610,10 @@ function Finder:refresh(args)
       extensions.run_hook('finder_refresh_post', self, visible, hl_ns, lines, args)
 
       H.finish_refresh(self)
+
+      apply_fyler_highlights(self)
+      update_fyler_clipboard_highlights(self)
+      update_fyler_indent_scope(self)
     end)
   )
 end
@@ -957,6 +2626,10 @@ function Finder:select(args)
 
   local node_data = M.parse_cursor_line(self)
   if not node_data then return end
+  if node_data.type == 'directory' and vim.api.nvim_get_option_value('modified', { buf = self.buf_id }) then
+    vim.cmd('write')
+    return
+  end
   if node_data.type == 'link' then
     vim.notify('BROKEN SYMLINK: ' .. node_data.path, vim.log.levels.WARN)
   elseif node_data.type == 'directory' then

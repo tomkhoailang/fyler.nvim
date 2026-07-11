@@ -73,6 +73,7 @@ M.get_confirmation = function(lines, highlights, callback)
   buffer_set_keymap(buf_id, 'n', '<C-c>', get_callback(false))
   -- <C-s> = save and close Fyler (same keycode as <C-S> in most terminals)
   buffer_set_keymap(buf_id, 'n', '<C-s>', get_callback('close'))
+  buffer_set_keymap(buf_id, 'n', 'q', get_callback(false))
 end
 
 return M
