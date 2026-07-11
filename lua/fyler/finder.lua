@@ -1551,6 +1551,7 @@ end
     for i, line in ipairs(lines) do
       local current_path, is_dir = get_path_for_line(inst, i)
       if current_path then
+        local vt_chunks = {}
         if i == 1 then
           -- Special handling for the parent folder header
           local deleted_count = 0
