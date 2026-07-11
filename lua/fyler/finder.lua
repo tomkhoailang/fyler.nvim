@@ -2258,13 +2258,17 @@ end
         if is_persisted then M.clipboard.deleted[p] = true end
       end
 
-      local final_lines = {}
-      for i = 1, #lines do
-        if not delete_set[i] then table.insert(final_lines, lines[i]) end
+      local to_delete = {}
+      for lnum_del, _ in pairs(delete_set) do
+        table.insert(to_delete, lnum_del)
+      end
+      table.sort(to_delete, function(a, b) return a > b end)
+
+      for _, lnum_del in ipairs(to_delete) do
+        vim.api.nvim_buf_set_lines(bufnr, lnum_del - 1, lnum_del, false, {})
       end
 
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
-
+      local final_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
       local new_lnum = math.min(lnum, #final_lines)
       if new_lnum > 0 then pcall(vim.api.nvim_win_set_cursor, self.win_id, { new_lnum, 0 }) end
       update_fyler_clipboard_highlights(self)
@@ -2321,13 +2325,17 @@ end
         if is_persisted then M.clipboard.deleted[p] = true end
       end
 
-      local final_lines = {}
-      for i = 1, #lines do
-        if not delete_set[i] then table.insert(final_lines, lines[i]) end
+      local to_delete = {}
+      for lnum_del, _ in pairs(delete_set) do
+        table.insert(to_delete, lnum_del)
+      end
+      table.sort(to_delete, function(a, b) return a > b end)
+
+      for _, lnum_del in ipairs(to_delete) do
+        vim.api.nvim_buf_set_lines(bufnr, lnum_del - 1, lnum_del, false, {})
       end
 
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
-
+      local final_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
       local new_lnum = math.min(start_line, #final_lines)
       if new_lnum > 0 then pcall(vim.api.nvim_win_set_cursor, self.win_id, { new_lnum, 0 }) end
       update_fyler_clipboard_highlights(self)
