@@ -325,11 +325,11 @@ H.compute_fs_actions = function(instance, id_to_path, buf_lines)
 
     if current_line:match("%S") and next_line:match("%S") then
       local is_new = current_line:match('/%d+') == nil
-      local current_indent = #(current_line:match("^(%s*)") or "")
-      local next_indent = #(next_line:match("^(%s*)") or "")
-      local ends_with_slash = current_line:match("[/\\]%s*$") ~= nil
+      local current_depth, current_content = parse_indent(current_line)
+      local next_depth, _ = parse_indent(next_line)
+      local ends_with_slash = current_content:match("[/\\]%s*$") ~= nil
 
-      if is_new and next_indent > current_indent and not ends_with_slash then
+      if is_new and next_depth > current_depth and not ends_with_slash then
         local content, trailing = current_line:match("^(.-)(%s*)$")
         preprocessed_lines[i] = content .. "/" .. trailing
       end
@@ -749,6 +749,33 @@ H.normalize_opts = function(opts)
   return config.get_config(opts)
 end
 
+local function parse_indent(line)
+  local depth = 0
+  local offset = 1
+  while true do
+    local sub2 = line:sub(offset, offset + 1)
+    if sub2 == "  " then
+      depth = depth + 1
+      offset = offset + 2
+    else
+      local sub4 = line:sub(offset, offset + 3)
+      if sub4 == "│ " then
+        depth = depth + 1
+        offset = offset + 4
+      else
+        local sub6 = line:sub(offset, offset + 5)
+        if sub6 == "└╴" or sub6 == "├╴" then
+          depth = depth + 1
+          offset = offset + 6
+        else
+          break
+        end
+      end
+    end
+  end
+  return depth, line:sub(offset)
+end
+
 ---@private
 ---@param buf_line string
 ---@return integer|nil
@@ -757,8 +784,8 @@ end
 ---@return boolean
 H.parse_buf_line = function(buf_line)
   local id = buf_line:match('/(%d+)')
-  local depth = (#buf_line:match('^(%s*)') * 0.5)
-  buf_line = buf_line:match('^%s*(.*)$')
+  local depth, cleaned_line = parse_indent(buf_line)
+  buf_line = cleaned_line
   if id then
     local name = buf_line:match('/%d+ (.*)$')
     local id_int = tonumber(id, 10)
