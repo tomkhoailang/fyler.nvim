@@ -1843,7 +1843,6 @@ end
         end
       end
     end, { buffer = bufnr, silent = true, nowait = true })
-    vim.keymap.set("n", "<C-c>", "c", { buffer = bufnr, silent = true, remap = true, nowait = true })
 
     -- Cut in normal mode
     vim.keymap.set("n", "x", function()
@@ -1854,7 +1853,6 @@ end
         update_fyler_clipboard_highlights(self)
       end
     end, { buffer = bufnr, silent = true, nowait = true })
-    vim.keymap.set("n", "<C-x>", "x", { buffer = bufnr, silent = true, remap = true, nowait = true })
 
     -- Copy in visual mode
     vim.keymap.set("v", "c", function()
@@ -1915,7 +1913,6 @@ end
         vim.fn.setreg('"', yank_text)
       end
     end, { buffer = bufnr, silent = true, nowait = true })
-    vim.keymap.set("v", "<C-c>", "c", { buffer = bufnr, silent = true, remap = true, nowait = true })
 
     -- Cut in visual mode
     vim.keymap.set("v", "x", function()
@@ -1966,7 +1963,6 @@ end
       end
       update_fyler_clipboard_highlights(self)
     end, { buffer = bufnr, silent = true, nowait = true })
-    vim.keymap.set("v", "<C-x>", "x", { buffer = bufnr, silent = true, remap = true, nowait = true })
 
     -- Paste in normal mode
     vim.keymap.set("n", "p", function()
@@ -2214,7 +2210,6 @@ end
         do_paste(resolved_items)
       end
     end, { buffer = bufnr, silent = true, nowait = true })
-    vim.keymap.set("n", "<C-v>", "p", { buffer = bufnr, silent = true, remap = true, nowait = true })
 
     -- Delete in normal mode
     vim.keymap.set("n", "dd", function()
