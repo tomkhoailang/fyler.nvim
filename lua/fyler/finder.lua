@@ -936,7 +936,6 @@ H.render_tree = function(instance, flat)
   local header_row = {
     tag = 'row',
     children = {
-      { tag = 'text', value = ' ', hl = 'FylerDirectoryIcon' },
       { tag = 'text', value = '.. (' .. instance.state.pseudo_root_path:gsub("[/\\]+$", ""):gsub("/", "\\") .. '\\..)', hl = 'FylerDirectoryName' }
     }
   }
