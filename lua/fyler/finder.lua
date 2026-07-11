@@ -286,14 +286,6 @@ H.build_fs_entry_ui = function(instance, item)
       icon_char = ''
       icon_hl = 'FylerNormal'
     end
-  elseif item.type == 'directory' then
-    local is_empty = is_dir_empty(instance, item.path)
-    if is_empty then
-      icon_char = item.expanded and '' or ''
-    else
-      icon_char = item.expanded and '' or ''
-    end
-    icon_hl = 'FylerDirectoryName'
   end
 
   if icon_char and #icon_char > 0 then
@@ -1126,10 +1118,34 @@ function Finder:mutate()
                   local entry_path = entry.path:gsub("[/\\]+$", "")
                   if entry_path == src:gsub("[/\\]+$", "") then
                     entry.path = dst
+                    entry.name = vim.fs.basename(dst)
                     local k_old = libpath.to_key(src)
                     local k_new = libpath.to_key(dst)
                     state.store_path_id[k_new] = state.store_path_id[k_old]
                     state.store_path_id[k_old] = nil
+
+                    -- Update parent's children node reference in the state trie
+                    local parent_path = vim.fs.dirname(src)
+                    local rel = libpath.to_rel(self.state.pseudo_root_path, parent_path)
+                    local parent_node = self.state.root
+                    if rel and rel ~= "" then
+                      local segments = libpath.do_split(rel)
+                      for _, segment in ipairs(segments) do
+                        if parent_node.children and parent_node.children[segment] then
+                          parent_node = parent_node.children[segment]
+                        else
+                          parent_node = nil
+                          break
+                        end
+                      end
+                    end
+                    local old_name = vim.fs.basename(src)
+                    local new_name = vim.fs.basename(dst)
+                    if parent_node and parent_node.children and parent_node.children[old_name] then
+                      local child_node = parent_node.children[old_name]
+                      parent_node.children[new_name] = child_node
+                      parent_node.children[old_name] = nil
+                    end
                   elseif entry.path:sub(1, #src_prefix) == src_prefix then
                     local rel = entry.path:sub(#src_prefix + 1)
                     local old_path = entry.path
@@ -1173,13 +1189,24 @@ function Finder:mutate()
 
           -- Close + jump if <C-s> triggered this write
           if _G.fyler_cs_save then
-            local jp = cursor_target
             _G.fyler_cs_save = nil
+            local is_single_file_create = false
+            local file_to_open = nil
+            if #ordered_actions == 1 then
+              local action = ordered_actions[1]
+              if action.name == "create" and not action.dst:match("[/\\]$") then
+                is_single_file_create = true
+                file_to_open = action.dst
+              end
+            end
+
             vim.schedule(function()
               self:close()
-              if jp and not jp:match('/$') then
+              if is_single_file_create and file_to_open then
                 vim.schedule(function()
-                  vim.cmd('edit ' .. vim.fn.fnameescape(jp))
+                  local libpath = require("fyler.lib.path")
+                  local os_path = libpath.to_os(libpath.to_abs(file_to_open))
+                  vim.cmd('edit ' .. vim.fn.fnameescape(os_path))
                 end)
               end
             end)
@@ -1503,11 +1530,13 @@ end
           end
           local is_expanded = inst.state.meta[libpath.to_key(key_path)] == true
 
-          local new_icon
-          if is_empty then
-            new_icon = is_expanded and "" or ""
-          else
-            new_icon = is_expanded and "" or ""
+          local new_icon, _ = icon.get(is_dir and "directory" or "file", key_path, { expanded = is_expanded })
+          if not new_icon or new_icon == "" then
+            if is_empty then
+              new_icon = is_expanded and "" or ""
+            else
+              new_icon = is_expanded and "" or ""
+            end
           end
 
           local after_guides = line:sub(count * 4 + 1)
@@ -2311,7 +2340,7 @@ end
       local min_col
       local id = line:match("/(%d+)")
       if id then
-        local prefix = line:match("^[%s%S]*/%" .. id .. "%s+")
+        local prefix = line:match("^[%s%S]*/" .. id .. "%s+")
         min_col = prefix and #prefix or 0
       else
         local prefix = line:match("^([│ \t]*%S+%s+)")
