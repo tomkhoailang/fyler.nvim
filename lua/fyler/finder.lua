@@ -1552,86 +1552,8 @@ end
     for i, line in ipairs(lines) do
       local current_path, is_dir = get_path_for_line(inst, i)
       if current_path then
-        local vt_chunks = {}
-        if is_dir then
-          local count = get_line_depth(bufnr, i)
-          local start_col = count * 4
-          local is_empty = true
-          if inst._parent_has_children_in_buffer and inst._parent_has_children_in_buffer[current_path] then
-            is_empty = false
-          else
-            local uv = vim.uv or vim.loop
-            local scan_path = current_path
-            local id = line:match("/(%d+)")
-            if id then
-              local entry = state.store[tonumber(id)]
-              if entry and entry.path and entry.type == "directory" then
-                if not uv.fs_stat(scan_path) then
-                  scan_path = entry.path
-                end
-              end
-            end
-
-            local handle = uv.fs_scandir(scan_path)
-            if handle then
-              while true do
-                local name, _ = uv.fs_scandir_next(handle)
-                if not name then break end
-                local child_path = scan_path .. "/" .. name
-                local check_path = child_path
-                if scan_path ~= current_path then
-                  check_path = current_path .. "/" .. name
-                end
-                if not M.clipboard.deleted[check_path] then
-                  is_empty = false
-                  break
-                end
-              end
-            end
-          end
-
-          local key_path = current_path
-          local id = line:match("/(%d+)")
-          if id then
-            local entry = state.store[tonumber(id)]
-            if entry and entry.path and entry.type == "directory" then
-              key_path = entry.path
-            end
-          end
-          local is_expanded = inst.state.meta[libpath.to_key(key_path)] == true
-
-          local new_icon, _ = icon.get(is_dir and "directory" or "file", key_path, { expanded = is_expanded })
-          if not new_icon or new_icon == "" then
-            if is_empty then
-              new_icon = is_expanded and "" or ""
-            else
-              new_icon = is_expanded and "" or ""
-            end
-          end
-
-          local after_guides = line:sub(count * 4 + 1)
-          local icon_char, rest = after_guides:match("^(%S+)%s+(.*)$")
-          if icon_char and icon_char:sub(1, 1) == "/" then
-            rest = after_guides
-            icon_char = ""
-          end
-
-          if icon_char and icon_char ~= new_icon then
-            local new_line = line:sub(1, count * 4) .. new_icon .. " " .. rest
-            if new_line ~= line then
-              vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, { new_line })
-              line = new_line
-            end
-          end
-
-          pcall(vim.api.nvim_buf_set_extmark, bufnr, hl_ns, i - 1, start_col, {
-            end_row = i - 1,
-            end_col = #line,
-            hl_group = "FylerDirectoryName",
-            priority = 100,
-            hl_mode = "combine",
-          })
-
+        if i == 1 then
+          -- Special handling for the parent folder header
           local deleted_count = 0
           for del_path, _ in pairs(M.clipboard.deleted) do
             local parent_path = vim.fs.dirname(del_path)
@@ -1643,61 +1565,154 @@ end
           if deleted_count > 0 then
             table.insert(vt_chunks, { " (deleted: " .. deleted_count .. ")", "FylerDeletedVT" })
           end
-        end
+        else
+          -- Normal line highlighting and collision detection
+          if is_dir then
+            local count = get_line_depth(bufnr, i)
+            local start_col = count * 4
+            local is_empty = true
+            if inst._parent_has_children_in_buffer and inst._parent_has_children_in_buffer[current_path] then
+              is_empty = false
+            else
+              local uv = vim.uv or vim.loop
+              local scan_path = current_path
+              local id = line:match("/(%d+)")
+              if id then
+                local entry = state.store[tonumber(id)]
+                if entry and entry.path and entry.type == "directory" then
+                  if not uv.fs_stat(scan_path) then
+                    scan_path = entry.path
+                  end
+                end
+              end
 
-        local is_collision = false
-        local clean_path = current_path:gsub("[/\\]+$", "")
-        local exists = vim.uv.fs_stat(libpath.to_os(clean_path)) ~= nil
-        local is_deleted_in_buffer = false
-        for del_p, _ in pairs(M.clipboard.deleted) do
-          if del_p:gsub("[/\\]+$", "") == clean_path then
-            is_deleted_in_buffer = true
-            break
+              local handle = uv.fs_scandir(scan_path)
+              if handle then
+                while true do
+                  local name, _ = uv.fs_scandir_next(handle)
+                  if not name then break end
+                  local child_path = scan_path .. "/" .. name
+                  local check_path = child_path
+                  if scan_path ~= current_path then
+                    check_path = current_path .. "/" .. name
+                  end
+                  if not M.clipboard.deleted[check_path] then
+                    is_empty = false
+                    break
+                  end
+                end
+              end
+            end
+
+            local key_path = current_path
+            local id = line:match("/(%d+)")
+            if id then
+              local entry = state.store[tonumber(id)]
+              if entry and entry.path and entry.type == "directory" then
+                key_path = entry.path
+              end
+            end
+            local is_expanded = inst.state.meta[libpath.to_key(key_path)] == true
+
+            local new_icon, _ = icon.get(is_dir and "directory" or "file", key_path, { expanded = is_expanded })
+            if not new_icon or new_icon == "" then
+              if is_empty then
+                new_icon = is_expanded and "" or ""
+              else
+                new_icon = is_expanded and "" or ""
+              end
+            end
+
+            local after_guides = line:sub(count * 4 + 1)
+            local icon_char, rest = after_guides:match("^(%S+)%s+(.*)$")
+            if icon_char and icon_char:sub(1, 1) == "/" then
+              rest = after_guides
+              icon_char = ""
+            end
+
+            if icon_char and icon_char ~= new_icon then
+              local new_line = line:sub(1, count * 4) .. new_icon .. " " .. rest
+              if new_line ~= line then
+                vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, { new_line })
+                line = new_line
+              end
+            end
+
+            pcall(vim.api.nvim_buf_set_extmark, bufnr, hl_ns, i - 1, start_col, {
+              end_row = i - 1,
+              end_col = #line,
+              hl_group = "FylerDirectoryName",
+              priority = 100,
+              hl_mode = "combine",
+            })
+
+            local deleted_count = 0
+            for del_path, _ in pairs(M.clipboard.deleted) do
+              local parent_path = vim.fs.dirname(del_path)
+              if parent_path == current_path then
+                deleted_count = deleted_count + 1
+              end
+            end
+
+            if deleted_count > 0 then
+              table.insert(vt_chunks, { " (deleted: " .. deleted_count .. ")", "FylerDeletedVT" })
+            end
           end
-        end
 
-        local id = line:match("/(%d+)")
-        local id_num = id and tonumber(id) or nil
-        if exists and not is_deleted_in_buffer then
-          if not id then
-            is_collision = true
-          else
+          local is_collision = false
+          local clean_path = current_path:gsub("[/\\]+$", "")
+          local exists = vim.uv.fs_stat(libpath.to_os(clean_path)) ~= nil
+          local is_deleted_in_buffer = false
+          for del_p, _ in pairs(M.clipboard.deleted) do
+            if del_p:gsub("[/\\]+$", "") == clean_path then
+              is_deleted_in_buffer = true
+              break
+            end
+          end
+
+          local id = line:match("/(%d+)")
+          local id_num = id and tonumber(id) or nil
+          if exists and not is_deleted_in_buffer then
+            if not id then
+              is_collision = true
+            else
+              local entry = state.store[id_num]
+              if entry and entry.path and current_path ~= entry.path then
+                is_collision = true
+              end
+            end
+          end
+
+          if is_collision then
+            table.insert(vt_chunks, { " (already exists)", "FylerMovedVT" })
+          elseif id_num then
             local entry = state.store[id_num]
             if entry and entry.path and current_path ~= entry.path then
-              is_collision = true
-            end
-          end
-        end
+              local rel_orig = entry.path
+              local pseudo_root = inst.state.pseudo_root_path
+              if entry.path:sub(1, #pseudo_root) == pseudo_root then
+                rel_orig = entry.path:sub(#pseudo_root + 2)
+                if rel_orig == "" then rel_orig = entry.path end
+              end
 
-        if is_collision then
-          table.insert(vt_chunks, { " (already exists)", "FylerMovedVT" })
-        elseif id_num then
-          local entry = state.store[id_num]
-          if entry and entry.path and current_path ~= entry.path then
-            local rel_orig = entry.path
-            local pseudo_root = inst.state.pseudo_root_path
-            if entry.path:sub(1, #pseudo_root) == pseudo_root then
-              rel_orig = entry.path:sub(#pseudo_root + 2)
-              if rel_orig == "" then rel_orig = entry.path end
-            end
-
-            if not is_implicit_move(current_path, entry.path) then
-              if id_counts[id_num] > 1 then
-                local current_name = vim.fs.basename(current_path)
-                local original_name = vim.fs.basename(entry.path)
-                if current_name ~= original_name then
-                  table.insert(vt_chunks, { " (copied and renamed from " .. rel_orig .. ")", "FylerCopiedVT" })
-                else
-                  table.insert(vt_chunks, { " (copied from " .. rel_orig .. ")", "FylerCopiedVT" })
-                end
-              else
-                local current_dir = vim.fs.dirname(current_path)
-                local original_dir = vim.fs.dirname(entry.path)
-                if current_dir == original_dir then
+              if not is_implicit_move(current_path, entry.path) then
+                if id_counts[id_num] > 1 then
+                  local current_name = vim.fs.basename(current_path)
                   local original_name = vim.fs.basename(entry.path)
-                  table.insert(vt_chunks, { " (renamed from " .. original_name .. ")", "FylerMovedVT" })
+                  if current_name ~= original_name then
+                    table.insert(vt_chunks, { " (copied and renamed from " .. rel_orig .. ")", "FylerCopiedVT" })
+                  else
+                    table.insert(vt_chunks, { " (copied from " .. rel_orig .. ")", "FylerCopiedVT" })
+                  end
                 else
-                  table.insert(vt_chunks, { " (moved from " .. rel_orig .. ")", "FylerMovedVT" })
+                  local current_dir = vim.fs.dirname(current_path)
+                  local original_dir = vim.fs.dirname(entry.path)
+                  if current_dir == original_dir then
+                    local original_name = vim.fs.basename(entry.path)
+                    table.insert(vt_chunks, { " (renamed from " .. original_name .. ")", "FylerMovedVT" })
+                  else
+                    table.insert(vt_chunks, { " (moved from " .. rel_orig .. ")", "FylerMovedVT" })
+                  end
                 end
               end
             end
