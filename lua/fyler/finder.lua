@@ -1025,6 +1025,31 @@ function Finder:mutate()
     :totable()
 
   local fs_actions, errors = H.compute_fs_actions(self, id_to_path, buf_lines)
+
+  -- Identify which paths are being deleted in this batch
+  local deleted_paths = {}
+  for _, action in ipairs(fs_actions) do
+    if action.name == "delete" and action.src then
+      deleted_paths[action.src:gsub("[/\\]+$", "")] = true
+    end
+  end
+
+  -- Filter out colliding create/move/copy actions where target already exists
+  local filtered_fs_actions = {}
+  for _, action in ipairs(fs_actions) do
+    local skip = false
+    if action.name ~= "delete" and action.dst then
+      local clean_dst = action.dst:gsub("[/\\]+$", "")
+      if vim.uv.fs_stat(libpath.to_os(clean_dst)) ~= nil and not deleted_paths[clean_dst] then
+        skip = true
+      end
+    end
+    if not skip then
+      table.insert(filtered_fs_actions, action)
+    end
+  end
+  fs_actions = filtered_fs_actions
+
   local graph, in_degree = H.build_action_dependency_graph(fs_actions, self.state.pseudo_root_path, errors)
 
   local queue = {}
@@ -1575,9 +1600,33 @@ end
           end
         end
 
+        local is_collision = false
+        local clean_path = current_path:gsub("[/\\]+$", "")
+        local exists = vim.uv.fs_stat(libpath.to_os(clean_path)) ~= nil
+        local is_deleted_in_buffer = false
+        for del_p, _ in pairs(M.clipboard.deleted) do
+          if del_p:gsub("[/\\]+$", "") == clean_path then
+            is_deleted_in_buffer = true
+            break
+          end
+        end
+
         local id = line:match("/(%d+)")
-        if id then
-          local id_num = tonumber(id)
+        local id_num = id and tonumber(id) or nil
+        if exists and not is_deleted_in_buffer then
+          if not id then
+            is_collision = true
+          else
+            local entry = state.store[id_num]
+            if entry and entry.path and current_path ~= entry.path then
+              is_collision = true
+            end
+          end
+        end
+
+        if is_collision then
+          table.insert(vt_chunks, { " (already exists)", "FylerMovedVT" })
+        elseif id_num then
           local entry = state.store[id_num]
           if entry and entry.path and current_path ~= entry.path then
             local rel_orig = entry.path
