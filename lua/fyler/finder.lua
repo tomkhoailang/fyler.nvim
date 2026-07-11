@@ -8,6 +8,33 @@ local libui = Fyler.import('fyler.lib.ui')
 local state = Fyler.import('fyler.state')
 local util = Fyler.import('fyler.util')
 
+local function parse_indent(line)
+  local depth = 0
+  local offset = 1
+  while true do
+    local sub2 = line:sub(offset, offset + 1)
+    if sub2 == "  " then
+      depth = depth + 1
+      offset = offset + 2
+    else
+      local sub4 = line:sub(offset, offset + 3)
+      if sub4 == "│ " then
+        depth = depth + 1
+        offset = offset + 4
+      else
+        local sub6 = line:sub(offset, offset + 5)
+        if sub6 == "└╴" or sub6 == "├╴" then
+          depth = depth + 1
+          offset = offset + 6
+        else
+          break
+        end
+      end
+    end
+  end
+  return depth, line:sub(offset)
+end
+
 ---@class fyler.FSEntry
 ---@field path string
 ---@field id integer
@@ -749,32 +776,7 @@ H.normalize_opts = function(opts)
   return config.get_config(opts)
 end
 
-local function parse_indent(line)
-  local depth = 0
-  local offset = 1
-  while true do
-    local sub2 = line:sub(offset, offset + 1)
-    if sub2 == "  " then
-      depth = depth + 1
-      offset = offset + 2
-    else
-      local sub4 = line:sub(offset, offset + 3)
-      if sub4 == "│ " then
-        depth = depth + 1
-        offset = offset + 4
-      else
-        local sub6 = line:sub(offset, offset + 5)
-        if sub6 == "└╴" or sub6 == "├╴" then
-          depth = depth + 1
-          offset = offset + 6
-        else
-          break
-        end
-      end
-    end
-  end
-  return depth, line:sub(offset)
-end
+
 
 ---@private
 ---@param buf_line string
@@ -808,6 +810,9 @@ end
 
 -- Reconstruct path for a buffer line (handles unpersisted files/directories/renames)
 local function get_path_for_line(inst, lnum)
+  if lnum == 1 then
+    return inst.state.pseudo_root_path:gsub("[/\\]+$", ""), true
+  end
   local bufnr = inst.buf_id
   local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
   
@@ -922,10 +927,20 @@ H.render_tree = function(instance, flat)
       local children, name_col = H.build_fs_entry_ui(instance, item)
       item._name_col = name_col
       visible[#visible + 1] = item
-      id_to_line[item.id] = #visible
+      id_to_line[item.id] = #visible + 1
       rows[#rows + 1] = { tag = 'row', children = children }
     end
   end
+
+  -- Prepend parent folder header row
+  local header_row = {
+    tag = 'row',
+    children = {
+      { tag = 'text', value = ' ', hl = 'FylerDirectoryIcon' },
+      { tag = 'text', value = '.. (' .. instance.state.pseudo_root_path:gsub("[/\\]+$", ""):gsub("/", "\\") .. '\\..)', hl = 'FylerDirectoryName' }
+    }
+  }
+  table.insert(rows, 1, header_row)
 
   instance._id_to_line = id_to_line
 
@@ -1050,6 +1065,9 @@ function Finder:mutate()
     .iter(vim.api.nvim_buf_get_lines(self.buf_id, 0, -1, false))
     :filter(function(buf_line) return #buf_line > 0 end)
     :totable()
+  if #buf_lines > 0 then
+    table.remove(buf_lines, 1)
+  end
 
   local fs_actions, errors = H.compute_fs_actions(self, id_to_path, buf_lines)
 
@@ -1855,6 +1873,7 @@ end
     -- Copy in normal mode
     vim.keymap.set("n", "c", function()
       local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      if lnum == 1 then return end
       local item_info = get_item_info_at_lnum(self, lnum)
       if item_info then
         toggle_clipboard(item_info, "copy")
@@ -1874,6 +1893,7 @@ end
     -- Cut in normal mode
     vim.keymap.set("n", "x", function()
       local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      if lnum == 1 then return end
       local item_info = get_item_info_at_lnum(self, lnum)
       if item_info then
         toggle_clipboard(item_info, "move")
@@ -1888,6 +1908,8 @@ end
       if start_line > end_line then
         start_line, end_line = end_line, start_line
       end
+      if start_line == 1 then start_line = 2 end
+      if start_line > end_line then return end
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
 
       local top_level_lnums = {}
@@ -1948,6 +1970,8 @@ end
       if start_line > end_line then
         start_line, end_line = end_line, start_line
       end
+      if start_line == 1 then start_line = 2 end
+      if start_line > end_line then return end
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
 
       local top_level_lnums = {}
@@ -2241,6 +2265,7 @@ end
     -- Delete in normal mode
     vim.keymap.set("n", "dd", function()
       local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+      if lnum == 1 then return end
       local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
       if #lines == 0 then return end
 
@@ -2303,6 +2328,8 @@ end
       if start_line > end_line then
         start_line, end_line = end_line, start_line
       end
+      if start_line == 1 then start_line = 2 end
+      if start_line > end_line then return end
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
 
       local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -2731,6 +2758,12 @@ function Finder:resize() util.window_resize(self.win_id, self.opts) end
 ---@param args { close: boolean|nil, tabedit: boolean|nil, split: boolean|nil, vsplit: boolean|nil }|nil
 function Finder:select(args)
   args = args or {}
+
+  local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+  if lnum == 1 then
+    self:visit({ parent = true })
+    return
+  end
 
   local node_data = M.parse_cursor_line(self)
   if not node_data then return end
