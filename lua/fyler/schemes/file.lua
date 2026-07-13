@@ -165,9 +165,7 @@ M.fs_mutate = function(actions, cb)
     if action.name == 'move' and action.src then
       local s = action.src:gsub('[/\\]+$', '')
       local stat = vim.uv.fs_stat(s)
-      if stat and stat.type == 'directory' then
-        folder_move_srcs[s] = true
-      end
+      if stat and stat.type == 'directory' then folder_move_srcs[s] = true end
     end
   end
 
@@ -181,8 +179,7 @@ M.fs_mutate = function(actions, cb)
       -- Skip child moves whose parent folder is also being moved in this batch.
       -- OS rename of a directory already carries all children atomically.
       for folder_src in pairs(folder_move_srcs) do
-        if action.src ~= folder_src
-          and action.src:sub(1, #folder_src + 1) == folder_src .. '/' then
+        if action.src ~= folder_src and action.src:sub(1, #folder_src + 1) == folder_src .. '/' then
           skip = true
           break
         end
@@ -191,18 +188,12 @@ M.fs_mutate = function(actions, cb)
       if not skip then
         local src_ok = vim.uv.fs_stat(action.src) ~= nil
         local dst_ok = vim.uv.fs_stat(action.dst) ~= nil
-        if not src_ok and dst_ok then
-          skip = true
-        end
+        if not src_ok and dst_ok then skip = true end
       end
     elseif action.name == 'delete' then
-      if not vim.uv.fs_stat(action.src) then
-        skip = true
-      end
+      if not vim.uv.fs_stat(action.src) then skip = true end
     end
-    if not skip then
-      table.insert(filtered_actions, action)
-    end
+    if not skip then table.insert(filtered_actions, action) end
   end
 
   local current_action

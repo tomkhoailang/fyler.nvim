@@ -11,9 +11,7 @@ M.do_join = function(...)
   local args = { ... }
   local last_arg = args[#args]
   if type(last_arg) == 'string' and last_arg:match('[/\\]$') then
-    if not res:match('[/\\]$') then
-      res = res .. '/'
-    end
+    if not res:match('[/\\]$') then res = res .. '/' end
   end
   return res
 end

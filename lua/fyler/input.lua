@@ -8,7 +8,9 @@ local util = require('fyler.util')
 ---@param mode string|string[]
 ---@param lhs string
 ---@param rhs string|function
-local buffer_set_keymap = function(buf_id, mode, lhs, rhs) vim.keymap.set(mode, lhs, rhs, { buffer = buf_id, silent = true, nowait = true }) end
+local buffer_set_keymap = function(buf_id, mode, lhs, rhs)
+  vim.keymap.set(mode, lhs, rhs, { buffer = buf_id, silent = true, nowait = true })
+end
 
 ---@param lines string[]|nil
 ---@param highlights table|nil

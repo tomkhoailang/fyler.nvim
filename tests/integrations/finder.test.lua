@@ -294,6 +294,26 @@ T['Finder with kind']['can create file'] = function(kind)
   helper.expect.equality(vim.fn.filereadable(helper.joinpath(tmpdir, 'new-file')), 1)
 end
 
+T['Finder with kind']['deleting empty line does not delete other files'] = function(kind)
+  local tmpdir = helper.get_tmpdir('data', { 'a-dir/', 'a-dir/aa-file', 'b-file' })
+  n.fwd_lua('require("fyler").setup')({})
+  n.fwd_lua('require("fyler").open')({ kind = kind, root_path = tmpdir })
+  vim.uv.sleep(10)
+  -- Expand a-dir/ to show aa-file (which is under it, depth 1)
+  n.type_keys('<CR>')
+  vim.uv.sleep(10)
+  -- Move cursor to line 2 (a-dir/), press 'o' to insert empty line at depth 0
+  n.type_keys({ 'j', 'o', '<ESC>' })
+  vim.uv.sleep(10)
+  -- Delete the empty line using 'dd'
+  n.type_keys({ 'dd', ':w<CR>' })
+  vim.uv.sleep(10)
+  n.type_keys('y')
+  vim.uv.sleep(10)
+  helper.expect.equality(vim.fn.filereadable(helper.joinpath(tmpdir, 'a-dir', 'aa-file')), 1)
+  helper.expect.equality(vim.fn.filereadable(helper.joinpath(tmpdir, 'b-file')), 1)
+end
+
 T['Finder with kind']['can copy file'] = function(kind)
   local tmpdir = helper.get_tmpdir('data', { 'a-file' })
   n.fwd_lua('require("fyler").setup')({})
