@@ -123,7 +123,6 @@ local default_config = {
     split_right = { width = '25%' },
     split_right_most = { width = '25%' },
   },
-  -- Key mappings organized by mode (see: fyler.Mapping)
   mappings = {
     n = {
       ['-'] = { action = 'visit', args = { parent = true } },
@@ -138,6 +137,9 @@ local default_config = {
       ['g.'] = { action = 'toggle_ui', args = { 'hidden_items' } },
       ['gi'] = { action = 'toggle_ui', args = { 'indent_guides' } },
       ['q'] = { action = 'close' },
+      ['P'] = { action = 'jump_to_parent' },
+      ['J'] = { action = 'jump_to_last_sibling' },
+      ['K'] = { action = 'jump_to_first_sibling' },
     },
   },
   -- UI configuration

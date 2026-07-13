@@ -3111,4 +3111,61 @@ M.window_goto_suitable = function(instance, path)
   util.window_resize(instance.win_id, instance.opts)
 end
 
+function Finder:jump_to_parent()
+  local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+  if lnum <= 1 then return end
+  local current_depth = get_line_depth(self, lnum)
+  for p = lnum - 1, 1, -1 do
+    local depth = get_line_depth(self, p)
+    if depth == current_depth - 1 then
+      vim.api.nvim_win_set_cursor(self.win_id, { p, 0 })
+      return
+    end
+  end
+end
+
+function Finder:jump_to_first_sibling()
+  local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+  if lnum <= 1 then return end
+  local current_depth = get_line_depth(self, lnum)
+
+  local parent_lnum = 1
+  for p = lnum - 1, 1, -1 do
+    local depth = get_line_depth(self, p)
+    if depth == current_depth - 1 then
+      parent_lnum = p
+      break
+    end
+  end
+
+  local target = parent_lnum + 1
+  if target <= vim.api.nvim_buf_line_count(self.buf_id) then
+    vim.api.nvim_win_set_cursor(self.win_id, { target, 0 })
+  end
+end
+
+function Finder:jump_to_last_sibling()
+  local lnum = vim.api.nvim_win_get_cursor(self.win_id)[1]
+  local line_count = vim.api.nvim_buf_line_count(self.buf_id)
+  if lnum <= 1 or lnum > line_count then return end
+  local current_depth = get_line_depth(self, lnum)
+
+  local end_lnum = line_count + 1
+  for p = lnum + 1, line_count do
+    local depth = get_line_depth(self, p)
+    if depth < current_depth then
+      end_lnum = p
+      break
+    end
+  end
+
+  for p = end_lnum - 1, lnum, -1 do
+    local depth = get_line_depth(self, p)
+    if depth == current_depth then
+      vim.api.nvim_win_set_cursor(self.win_id, { p, 0 })
+      return
+    end
+  end
+end
+
 return M
