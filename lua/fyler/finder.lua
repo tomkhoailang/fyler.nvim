@@ -1118,8 +1118,11 @@ function Finder:follow(args)
   })
 end
 
-function Finder:mutate()
-  if not vim.api.nvim_get_option_value('modified', { buf = self.buf_id }) then return end
+function Finder:mutate(cb)
+  if not vim.api.nvim_get_option_value('modified', { buf = self.buf_id }) then
+    if cb then cb() end
+    return
+  end
 
   local id_to_path = {}
   self.state:walk(function(node, depth)
@@ -1199,11 +1202,13 @@ function Finder:mutate()
 
   if #errors > 0 then
     vim.notify(table.concat(errors, '\n'), vim.log.levels.ERROR)
+    if cb then cb(errors) end
     return
   end
 
   if #order == 0 then
     util.buffer_set_option(self.buf_id, 'modified', false)
+    if cb then cb() end
     return
   end
 
@@ -1228,6 +1233,7 @@ function Finder:mutate()
         vim.schedule(function()
           if err then
             vim.notify('Failed to apply changes: ' .. err, vim.log.levels.ERROR)
+            if cb then cb(err) end
             return
           end
 
@@ -1339,6 +1345,7 @@ function Finder:mutate()
               end
             end)
           end
+          if cb then cb() end
         end)
       end)
     end
@@ -1359,6 +1366,8 @@ function Finder:mutate()
         -- 'close' means <C-s> was pressed in the confirmation window
         if confirmed == 'close' then _G.fyler_cs_save = true end
         do_execute()
+      else
+        if cb then cb('cancelled') end
       end
     end)
   end
@@ -2469,6 +2478,10 @@ local function setup_buffer_mappings(self)
     for _ in line:gmatch('│ ') do
       count = count + 1
     end
+    local node_data = M.parse_cursor_line(self)
+    if node_data and node_data.type == 'directory' and self.state.meta[libpath.to_key(node_data.path)] then
+      count = count + 1
+    end
     local indent = string.rep('│ ', count)
     vim.api.nvim_buf_set_lines(bufnr, lnum, lnum, false, { indent })
     vim.api.nvim_win_set_cursor(self.win_id, { lnum + 1, #indent })
@@ -2845,7 +2858,9 @@ function Finder:select(args)
   local node_data = M.parse_cursor_line(self)
   if not node_data then return end
   if node_data.type == 'directory' and vim.api.nvim_get_option_value('modified', { buf = self.buf_id }) then
-    vim.cmd('write')
+    self:mutate(function(err)
+      if not err then vim.schedule(function() self:select(args) end) end
+    end)
     return
   end
   if node_data.type == 'link' then

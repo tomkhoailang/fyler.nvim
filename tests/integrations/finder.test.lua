@@ -295,15 +295,17 @@ T['Finder with kind']['can create file'] = function(kind)
 end
 
 T['Finder with kind']['deleting empty line does not delete other files'] = function(kind)
-  local tmpdir = helper.get_tmpdir('data', { 'a-dir/', 'a-dir/aa-file', 'b-file' })
+  n.setup()
+  n.set_size(12, 50)
+  local tmpdir = helper.get_tmpdir('data_delete_empty', { 'a-dir/', 'a-dir/aa-file', 'b-file' })
   n.fwd_lua('require("fyler").setup')({})
   n.fwd_lua('require("fyler").open')({ kind = kind, root_path = tmpdir })
   vim.uv.sleep(10)
   -- Expand a-dir/ to show aa-file (which is under it, depth 1)
-  n.type_keys('<CR>')
+  n.type_keys({ 'j', '<CR>' })
   vim.uv.sleep(10)
-  -- Move cursor to line 2 (a-dir/), press 'o' to insert empty line at depth 0
-  n.type_keys({ 'j', 'o', '<ESC>' })
+  -- Cursor is on line 2 (a-dir/). Press 'o' to insert empty line at depth 1
+  n.type_keys({ 'o', '<ESC>' })
   vim.uv.sleep(10)
   -- Delete the empty line using 'dd'
   n.type_keys({ 'dd', ':w<CR>' })
@@ -312,6 +314,50 @@ T['Finder with kind']['deleting empty line does not delete other files'] = funct
   vim.uv.sleep(10)
   helper.expect.equality(vim.fn.filereadable(helper.joinpath(tmpdir, 'a-dir', 'aa-file')), 1)
   helper.expect.equality(vim.fn.filereadable(helper.joinpath(tmpdir, 'b-file')), 1)
+end
+
+T['Finder with kind']['o on open directory inserts line with increased indent'] = function(kind)
+  n.setup()
+  n.set_size(12, 50)
+  local tmpdir = helper.get_tmpdir('data_open_indent', { 'a-dir/', 'a-dir/aa-file' })
+  n.fwd_lua('require("fyler").setup')({})
+  n.fwd_lua('require("fyler").open')({ kind = kind, root_path = tmpdir })
+  vim.uv.sleep(10)
+  -- Expand a-dir/ to show aa-file (which is under it, depth 1)
+  n.type_keys({ 'j', '<CR>' })
+  vim.uv.sleep(10)
+  -- Cursor is on line 2 (a-dir/). Press 'o' to insert empty line below it
+  n.type_keys({ 'o', 'new-file', '<ESC>' })
+  vim.uv.sleep(10)
+  -- The line below a-dir/ (which is now line 3) should have indent '│ ' and the text 'new-file'
+  local lines = n.fwd_lua('vim.api.nvim_buf_get_lines')(0, 0, -1, false)
+  local line3 = lines[3] or ''
+  helper.expect.equality(line3:match('^│ '), '│ ')
+end
+
+T['Finder with kind']['can toggle directory directly after mutate/dd without double enter'] = function(kind)
+  n.setup()
+  n.set_size(12, 50)
+  local tmpdir = helper.get_tmpdir('data_toggle_enter', { 'a-dir/', 'a-dir/aa-file' })
+  n.fwd_lua('require("fyler").setup')({})
+  n.fwd_lua('require("fyler").open')({ kind = kind, root_path = tmpdir })
+  vim.uv.sleep(10)
+  -- Expand a-dir/
+  n.type_keys({ 'j', '<CR>' })
+  vim.uv.sleep(10)
+
+  -- Cursor is on line 2 (a-dir/). Press 'o' then 'dd'
+  n.type_keys({ 'o', '<ESC>', 'dd' })
+  vim.uv.sleep(10)
+
+  -- Move cursor up to line 2 (a-dir/) and toggle it using '<CR>'. It should collapse a-dir/ immediately on the first Enter!
+  n.type_keys({ 'k', '<CR>' })
+  vim.uv.sleep(10)
+
+  -- If collapsed, the buffer should not show aa-file anymore.
+  local lines = n.fwd_lua('vim.api.nvim_buf_get_lines')(0, 0, -1, false)
+  -- Buffer should only contain the parent dir and a-dir/ (lines 1 and 2)
+  helper.expect.equality(#lines, 2)
 end
 
 T['Finder with kind']['can copy file'] = function(kind)
