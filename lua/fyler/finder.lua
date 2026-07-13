@@ -799,8 +799,15 @@ end
 ---@private
 ---@return table, integer, table
 -- Get indentation depth of a line
-local function get_line_depth(bufnr, lnum)
-  local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+-- Get indentation depth of a line
+local function get_line_depth(inst_or_bufnr, lnum)
+  local line
+  if type(inst_or_bufnr) == "table" and inst_or_bufnr._lines_cache then
+    line = inst_or_bufnr._lines_cache[lnum] or ""
+  else
+    local bufnr = type(inst_or_bufnr) == "table" and inst_or_bufnr.buf_id or inst_or_bufnr
+    line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+  end
   local count = 0
   for _ in line:gmatch("│ ") do
     count = count + 1
@@ -814,7 +821,12 @@ local function get_path_for_line(inst, lnum)
     return inst.state.pseudo_root_path:gsub("[/\\]+$", ""), true
   end
   local bufnr = inst.buf_id
-  local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+  local line
+  if inst._lines_cache then
+    line = inst._lines_cache[lnum] or ""
+  else
+    line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+  end
   
   -- Determine if it is a directory from its concealed ID or trailing slash
   local has_id_dir = false
@@ -826,7 +838,7 @@ local function get_path_for_line(inst, lnum)
     end
   end
 
-  local count = get_line_depth(bufnr, lnum)
+  local count = get_line_depth(inst, lnum)
   local content = line:sub(count * 4 + 1)
   
   -- Extract name by stripping concealed ID prefix and any preceding icons/spaces
@@ -858,7 +870,7 @@ local function get_path_for_line(inst, lnum)
         return p, is_dir
       else
         for p = lnum - 1, 1, -1 do
-          local p_count = get_line_depth(bufnr, p)
+          local p_count = get_line_depth(inst, p)
           if p_count == count - 1 then
             local parent_path, _ = get_path_for_line(inst, p)
             local res = parent_path:gsub("[/\\]+$", "")
@@ -878,7 +890,7 @@ local function get_path_for_line(inst, lnum)
 
   -- Find parent line (first line above with depth = count - 1)
   for p = lnum - 1, 1, -1 do
-    local p_count = get_line_depth(bufnr, p)
+    local p_count = get_line_depth(inst, p)
     if p_count == count - 1 then
       local parent_path, _ = get_path_for_line(inst, p)
       local path = libpath.do_join(parent_path, name)
@@ -890,6 +902,93 @@ local function get_path_for_line(inst, lnum)
   return path:gsub("[/\\]+$", ""), is_dir
 end
 
+local function resolve_all_paths(inst, lines)
+  local paths = {}
+  local is_dirs = {}
+  local depths = {}
+  paths[1] = inst.state.pseudo_root_path:gsub("[/\\]+$", "")
+  is_dirs[1] = true
+  depths[1] = -1
+
+  for lnum = 2, #lines do
+    local line = lines[lnum] or ""
+    local has_id_dir = false
+    local id = line:match("/(%d+)")
+    local id_num = id and tonumber(id) or nil
+    if id_num then
+      local entry = state.store[id_num]
+      if entry then
+        has_id_dir = entry.type == "directory"
+      end
+    end
+
+    local count = 0
+    for _ in line:gmatch("│ ") do
+      count = count + 1
+    end
+    depths[lnum] = count
+
+    local content = line:sub(count * 4 + 1)
+    local name
+    if id_num then
+      name = content:match("/%d+%s+(.*)$") or content:match("/%d+$") or content
+    else
+      name = content
+    end
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+
+    local is_dir = false
+    if name ~= "" then
+      local has_slash = line:match("[/\\]%s*$") ~= nil or name:match("[/\\]%s*$") ~= nil
+      is_dir = has_slash or has_id_dir
+      if has_slash then
+        name = name:gsub("[/\\]%s*$", "")
+      end
+    else
+      is_dir = true
+    end
+
+    is_dirs[lnum] = is_dir
+
+    if name == "" then
+      if id_num then
+        is_dir = has_id_dir
+        if count == 0 then
+          paths[lnum] = inst.state.pseudo_root_path:gsub("[/\\]+$", "")
+        else
+          for p = lnum - 1, 1, -1 do
+            if depths[p] == count - 1 then
+              paths[lnum] = paths[p]
+              break
+            end
+          end
+        end
+      else
+        paths[lnum] = inst.state.pseudo_root_path:gsub("[/\\]+$", "")
+      end
+    else
+      if count == 0 then
+        paths[lnum] = paths[1] .. '/' .. name
+      else
+        local resolved = false
+        for p = lnum - 1, 1, -1 do
+          if depths[p] == count - 1 then
+            paths[lnum] = paths[p] .. '/' .. name
+            resolved = true
+            break
+          end
+        end
+        if not resolved then
+          paths[lnum] = paths[1] .. '/' .. name
+        end
+      end
+    end
+    paths[lnum] = paths[lnum]:gsub("[/\\]+$", "")
+  end
+
+  return paths, is_dirs, depths
+end
+
 local function clean_line_for_yank(line)
   return (line:gsub("/%d+%s", ""):gsub("/%d+$", ""))
 end
@@ -899,8 +998,10 @@ H.render_tree = function(instance, flat)
   local parent_has_children = {}
   local bufnr = instance.buf_id
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  instance._lines_cache = lines
+  local paths, _ = resolve_all_paths(instance, lines)
   for l = 1, #lines do
-    local p, _ = get_path_for_line(instance, l)
+    local p = paths[l]
     if p then
       local parent = vim.fs.dirname(p)
       if parent then
@@ -1492,6 +1593,7 @@ end
     vim.api.nvim_set_hl(0, "FylerMovedVT", { fg = "#e5c07b", italic = true, default = true })
 
     local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    inst._lines_cache = lines
     
     local id_counts = {}
     for _, line in ipairs(lines) do
@@ -1508,6 +1610,8 @@ end
         M.clipboard.deleted[entry.path] = nil
       end
     end
+
+    local paths, is_dirs, depths = resolve_all_paths(inst, lines)
 
     -- Identify implicit moves due to parent renames
     local function is_implicit_move(path, entry_path)
@@ -1530,7 +1634,7 @@ end
             for l = 1, #lines do
               local line = lines[l]
               if line:match("/" .. p_id .. "%s") or line:match("/" .. p_id .. "$") then
-                p_current_path = get_path_for_line(inst, l)
+                p_current_path = paths[l]
                 break
               end
             end
@@ -1549,7 +1653,7 @@ end
     end
 
     for i, line in ipairs(lines) do
-      local current_path, is_dir = get_path_for_line(inst, i)
+      local current_path, is_dir = paths[i], is_dirs[i]
       if current_path then
         local vt_chunks = {}
         if i == 1 then
@@ -1567,47 +1671,16 @@ end
           end
         else
           -- Normal line highlighting and collision detection
-          if is_dir then
-            local count = get_line_depth(bufnr, i)
-            local start_col = count * 4
-            local is_empty = true
-            if inst._parent_has_children_in_buffer and inst._parent_has_children_in_buffer[current_path] then
-              is_empty = false
-            else
-              local uv = vim.uv or vim.loop
-              local scan_path = current_path
-              local id = line:match("/(%d+)")
-              if id then
-                local entry = state.store[tonumber(id)]
-                if entry and entry.path and entry.type == "directory" then
-                  if not uv.fs_stat(scan_path) then
-                    scan_path = entry.path
-                  end
-                end
-              end
+          local id = line:match("/(%d+)")
+          local id_num = id and tonumber(id) or nil
 
-              local handle = uv.fs_scandir(scan_path)
-              if handle then
-                while true do
-                  local name, _ = uv.fs_scandir_next(handle)
-                  if not name then break end
-                  local child_path = scan_path .. "/" .. name
-                  local check_path = child_path
-                  if scan_path ~= current_path then
-                    check_path = current_path .. "/" .. name
-                  end
-                  if not M.clipboard.deleted[check_path] then
-                    is_empty = false
-                    break
-                  end
-                end
-              end
-            end
+          if is_dir then
+            local count = depths[i]
+            local start_col = count * 4
 
             local key_path = current_path
-            local id = line:match("/(%d+)")
-            if id then
-              local entry = state.store[tonumber(id)]
+            if id_num then
+              local entry = state.store[id_num]
               if entry and entry.path and entry.type == "directory" then
                 key_path = entry.path
               end
@@ -1616,6 +1689,39 @@ end
 
             local new_icon, _ = icon.get(is_dir and "directory" or "file", key_path, { expanded = is_expanded })
             if not new_icon or new_icon == "" then
+              local is_empty = true
+              if inst._parent_has_children_in_buffer and inst._parent_has_children_in_buffer[current_path] then
+                is_empty = false
+              else
+                local uv = vim.uv or vim.loop
+                local scan_path = current_path
+                if id_num then
+                  local entry = state.store[id_num]
+                  if entry and entry.path and entry.type == "directory" then
+                    if not uv.fs_stat(scan_path) then
+                      scan_path = entry.path
+                    end
+                  end
+                end
+
+                local handle = uv.fs_scandir(scan_path)
+                if handle then
+                  while true do
+                    local name, _ = uv.fs_scandir_next(handle)
+                    if not name then break end
+                    local child_path = scan_path .. "/" .. name
+                    local check_path = child_path
+                    if scan_path ~= current_path then
+                      check_path = current_path .. "/" .. name
+                    end
+                    if not M.clipboard.deleted[check_path] then
+                      is_empty = false
+                      break
+                    end
+                  end
+                end
+              end
+
               if is_empty then
                 new_icon = is_expanded and "" or ""
               else
@@ -1661,7 +1767,6 @@ end
 
           local is_collision = false
           local clean_path = current_path:gsub("[/\\]+$", "")
-          local exists = vim.uv.fs_stat(libpath.to_os(clean_path)) ~= nil
           local is_deleted_in_buffer = false
           for del_p, _ in pairs(M.clipboard.deleted) do
             if del_p:gsub("[/\\]+$", "") == clean_path then
@@ -1670,10 +1775,19 @@ end
             end
           end
 
-          local id = line:match("/(%d+)")
-          local id_num = id and tonumber(id) or nil
+          local exists = false
+          if id_num then
+            local entry = state.store[id_num]
+            if entry and entry.path and current_path == entry.path then
+              exists = true
+            end
+          end
+          if not exists then
+            exists = vim.uv.fs_stat(libpath.to_os(clean_path)) ~= nil
+          end
+
           if exists and not is_deleted_in_buffer then
-            if not id then
+            if not id_num then
               is_collision = true
             else
               local entry = state.store[id_num]
@@ -1735,8 +1849,11 @@ end
     if vim.bo[bufnr].filetype ~= "fyler_finder" then return end
 
     local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    inst._lines_cache = lines
+    local paths, _, depths = resolve_all_paths(inst, lines)
+
     for i = 1, #lines do
-      local path, _ = get_path_for_line(inst, i)
+      local path = paths[i]
       if path then
         M.clipboard.deleted[path] = nil
       end
@@ -1760,9 +1877,9 @@ end
     local hl_group = M.clipboard.action == "copy" and "FylerCopied" or "FylerCut"
 
     for i = 1, #lines do
-      local path, _ = get_path_for_line(inst, i)
+      local path = paths[i]
       if path and clipboard_map[path] then
-        local count = get_line_depth(bufnr, i)
+        local count = depths[i]
         local indent_len = count * 4
 
         local line = lines[i] or ""
@@ -1794,12 +1911,12 @@ end
     local lnum = cursor[1]
     local line_count = vim.api.nvim_buf_line_count(bufnr)
 
-    local count = get_line_depth(bufnr, lnum)
+    local count = get_line_depth(inst, lnum)
     if count == 0 then return end
 
     local start_lnum = lnum
     for l = lnum - 1, 1, -1 do
-      if get_line_depth(bufnr, l) < count then
+      if get_line_depth(inst, l) < count then
         start_lnum = l
         break
       end
@@ -1807,7 +1924,7 @@ end
 
     local end_lnum = lnum
     for l = lnum + 1, line_count do
-      if get_line_depth(bufnr, l) >= count then
+      if get_line_depth(inst, l) >= count then
         end_lnum = l
       else
         break
@@ -1838,11 +1955,12 @@ end
     vim.api.nvim_buf_clear_namespace(bufnr, unsaved_ns, 0, -1)
 
     local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    inst._lines_cache = lines
     for i, line in ipairs(lines) do
       if line:match("%S") then
         local has_id = line:match('/%d+') ~= nil
         if not has_id then
-          local count = get_line_depth(bufnr, i)
+          local count = get_line_depth(inst, i)
           local indent_len = count * 4
 
           if indent_len > 0 then

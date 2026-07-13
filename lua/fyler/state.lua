@@ -30,8 +30,9 @@ function M.store_register_fs_entry(fs_entry)
   if id then return id end
   fs_entry.id = M.store_next_id
   M.store_next_id = M.store_next_id + 1
+  fs_entry.padded_name = libfs.pad(fs_entry.name)
   M.store[fs_entry.id] = fs_entry
-  M.store_path_id[libpath.to_key(fs_entry.path)] = fs_entry.id
+  M.store_path_id[k] = fs_entry.id
   return fs_entry.id
 end
 
@@ -85,11 +86,19 @@ function M.new(root_path, scheme)
           return
         end
         target_node.children = {}
-        vim.iter(entries):each(function(entry)
-          local entry_node_value = M.store_path_id[libpath.to_key(entry.path)]
-          if not entry_node_value then entry_node_value = M.store_register_fs_entry(entry) end
+        for _, entry in ipairs(entries) do
+          local k = libpath.to_key(entry.path)
+          local entry_node_value = M.store_path_id[k]
+          if not entry_node_value then
+            entry.id = M.store_next_id
+            M.store_next_id = M.store_next_id + 1
+            entry.padded_name = libfs.pad(entry.name)
+            M.store[entry.id] = entry
+            M.store_path_id[k] = entry.id
+            entry_node_value = entry.id
+          end
           target_node.children[entry.name] = { value = entry_node_value }
-        end)
+        end
         update_target_node_callback(target_node)
       end)
     end)

@@ -128,8 +128,9 @@ M.fs_scan_dir = function(path, cb)
       if not chunk then break end
       vim.list_extend(entries, chunk)
     end
+    local path_sep = (path:sub(-1) == '/' or path:sub(-1) == '\\') and '' or '/'
     for _, entry in ipairs(entries) do
-      entry.path = libpath.do_join(path, entry.name)
+      entry.path = path .. path_sep .. entry.name
       entry.full_path = entry.path
       if entry.type == 'link' then
         local stat_err, stat = uv.fs_stat(entry.path)

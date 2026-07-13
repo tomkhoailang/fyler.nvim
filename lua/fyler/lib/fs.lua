@@ -29,6 +29,10 @@ end
 ---@param x fyler.FSEntry
 ---@param y fyler.FSEntry
 ---@return boolean
+M.pad = function(str)
+  return (str:gsub('%d+', function(n) return string.format('%010d', n) end))
+end
+
 M.sort = function(x, y)
   if not x.path or not y.path then return false end
   local x_is_dir = x.type == 'directory'
@@ -38,12 +42,7 @@ M.sort = function(x, y)
   elseif not x_is_dir and y_is_dir then
     return false
   else
-    ---@param str string
-    ---@return string
-    local pad = function(str)
-      return (str:gsub('%d+', function(n) return string.format('%010d', n) end))
-    end
-    return pad(x.name) < pad(y.name)
+    return (x.padded_name or x.name) < (y.padded_name or y.name)
   end
 end
 
